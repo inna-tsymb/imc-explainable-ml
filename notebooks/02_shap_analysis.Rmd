@@ -1,0 +1,235 @@
+---
+title: "shap_analysis (XAI for IMC Classifier)"
+---
+
+```{r load-shap-libraries, message=FALSE}
+library(xgboost)
+library(shapviz)
+library(SHAPforxgboost)
+library(ggplot2)
+library(dplyr)
+library(patchwork)
+library(purrr)
+library(SingleCellExperiment)
+library(SummarizedExperiment)
+```
+
+Ensuring that base_path and objects from the previous step are accessible.
+```{r}
+base_path <- file.path(path.expand("~"), "Desktop", "proteomics", "XGBoost_classifier", "Panel_2_10")
+final_model <- readRDS(file.path(base_path, "classifier_xgboost.rds"))
+train_sce <- readRDS(file.path(base_path, "ROut", "train_sce.rds"))
+```
+
+Reconstruct the exact feature matrix X used as input for the final model
+```{r}
+marker_keep <- !grepl("DNA|Histone", rownames(train_sce))
+X <- t(assay(train_sce, "exprs")[marker_keep, ])
+```
+
+Retrieve cell type names (class mapping)
+```{r}
+label_mapping <- levels(factor(train_sce$cell_labels))
+```
+
+Sanity check for feature matching
+```{r}
+stopifnot(ncol(X) == 41)
+```
+
+Compute SHAP Values via shapviz
+```{r}
+shp_bundle <- shapviz(final_model, X_pred = X)
+names(shp_bundle) <- label_mapping
+print(shp_bundle)
+```
+
+# Global SHAP & Structural Interpretations
+
+## 1. Global mean |SHAP| bar chart
+This averages absolute SHAP values across ALL cell classes to show overall marker ranking.
+```{r global-and-structural-shap}
+
+p_global_imp <- sv_importance(shp_bundle, kind = "bar", max_display = 20) +
+  theme_bw() +
+  labs(
+    title = "Global Mean |SHAP| Feature Importance",
+    subtitle = "Overall marker contribution averaged across all cell types",
+    x = "Mean |SHAP Value|"
+  )
+
+p_global_imp
+ggsave(
+  filename = file.path(base_path, "ROut", "shap_global_importance.png"), 
+  plot = p_global_imp, 
+  width = 16, 
+  height = 9
+)
+```
+
+## 2. SHAP beeswarm — all test cells
+This combines the distributions of all classes into a singular overarching summary plot.
+```{r}
+p_global_beeswarm <- shapviz::sv_importance(shp_bundle, kind = "beeswarm", max_display = 10) &
+  theme_bw() +
+  theme(
+    axis.text.y = element_text(size = 7, face = "bold"),
+    axis.text.x = element_text(size = 8),
+    plot.title = element_text(face = "bold", size = 14),
+    strip.text = element_text(face = "bold", size = 10)
+  )
+
+p_global_beeswarm
+ggsave(
+  filename = file.path(base_path, "ROut", "shap_beeswarm_global.png"), 
+  plot = p_global_beeswarm, 
+  width = 20, 
+  height = 14,
+  dpi = 300
+)
+```
+
+## 3. Marker x cell-type SHAP heatmap
+```{r}
+mean_shap_df <- purrr::imap_dfr(shp_bundle, function(shp, class_name) {
+  data.frame(
+    Marker = colnames(shp$S),
+    Mean_Absolute_SHAP = colMeans(abs(shp$S)),
+    Cell_Type = class_name
+  )
+})
+
+p_heatmap <- ggplot(mean_shap_df, aes(x = Cell_Type, y = Marker, fill = Mean_Absolute_SHAP)) +
+  geom_tile(color = "white", linewidth = 0.1) +
+  scale_fill_viridis_c(option = "inferno", name = "Mean |SHAP|") +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, face = "bold"),
+    axis.text.y = element_text(face = "bold"),
+    plot.title = element_text(face = "bold", size = 14),
+    panel.grid = element_blank()
+  ) +
+  labs(
+    title = "Marker × Cell-Type SHAP Importance Heatmap",
+    subtitle = "Direct visualization of learned feature importance per cell lineage",
+    x = "Cell Phenotype Class",
+    y = "Spatial Proteomics Marker"
+  )
+
+p_heatmap
+ggsave(
+  filename = file.path(base_path, "ROut", "shap_class_heatmap.png"), 
+  plot = p_heatmap, 
+  width = 16, 
+  height = 9
+)
+
+```
+
+# Individual markers examinations (examples)
+
+Function to generate and format the SHAP beeswarm plot
+```{r}
+plot_cell_type_shap <- function(shp_obj, cell_type_name, top_n = 15) {
+  sv_importance(shp_obj[[cell_type_name]], kind = "beeswarm", max_display = top_n) +
+    theme_bw() +
+    labs(
+      title = paste("SHAP Feature Contributions for Class:", cell_type_name),
+      subtitle = "How marker expression drives the model choice for this cell type",
+      x = "SHAP Value (Impact on Model Prediction)"
+    )
+}
+```
+
+
+## Feature contributions for CD8 and Tumor cells
+```{r}
+
+# Example A: Why does the model classify cells as CD8?
+p_cd8 <- plot_cell_type_shap(shp_bundle, "CD8")
+p_cd8
+
+# Example B: What characterizes Tumor cells?
+p_tumor <- plot_cell_type_shap(shp_bundle, "Tumor")
+p_tumor
+
+#Save plots to the project output directory
+ggsave(file.path(base_path, "ROut", "shap_beeswarm_CD8.png"), plot = p_cd8, width = 8, height = 6)
+ggsave(file.path(base_path, "ROut", "shap_beeswarm_Tumor.png"), plot = p_tumor, width = 8, height = 6)
+```
+
+## Global feature importance for CD8 and NK
+```{r}
+#Global feature importance (Mean |SHAP|) for CD8
+p_imp_cd8 <- sv_importance(shp_bundle$CD8, kind = "bar", max_display = 15) + 
+  labs(title = "Feature Importance for CD8") + theme_minimal()
+
+#Global feature importance (Mean |SHAP|) for NK
+p_imp_nk <- sv_importance(shp_bundle$NK, kind = "bar", max_display = 15) + 
+  labs(title = "Feature Importance for NK") + theme_minimal()
+
+#Display them side-by-side using patchwork
+p_compare <- p_imp_cd8 + p_imp_nk
+p_compare
+ggsave(file.path(base_path, "ROut", "shap_importance_CD8_vs_NK.png"), plot = p_compare, width = 12, height = 6)
+```
+
+##CD3 x CD8a dependence plot
+Analyzes the core lymphoid lineage switch to see how CD3 impact scales with CD8a expression.
+```{r}
+p_cd3_cd8a <- sv_dependence(
+  shp_bundle$CD8, 
+  v = "CD3", 
+  color_var = "CD8a"
+) +
+  theme_bw() +
+  labs(
+    title = "Lymphoid Lineage Interaction: CD3 × CD8a",
+    subtitle = "Evaluating CD3 SHAP dynamics across the CD8a cytotoxic axis",
+    x = "CD3 Expression Intensity (asinh)",
+    y = "SHAP Value for CD3"
+  )
+
+p_cd3_cd8a
+ggsave(
+  filename = file.path(base_path, "ROut", "shap_interaction_CD3_CD8a.png"), 
+  plot = p_cd3_cd8a, 
+  width = 16, 
+  height = 9
+)
+```
+
+## A. Myeloid Differentiation: MacCD204 vs. MacCD209
+We look at the top macrophage/dendritic subsets to understand how the model draws sharp boundaries between closely related myeloid phenotypes.
+```{r shap-myeloid-dynamics, fig.height=6, fig.width=18}
+p_mac204 <- plot_cell_type_shap(shp_bundle, "MacCD204", top_n = 10) +
+  labs(subtitle = "Marker rules for M2-like Macrophages")
+
+p_mac209 <- plot_cell_type_shap(shp_bundle, "MacCD209", top_n = 10) +
+  labs(subtitle = "Marker rules for CD209+ Macrophages/DCs")
+
+# Display side-by-side using patchwork
+p_myeloid_compare <- p_mac204 + p_mac209
+p_myeloid_compare
+
+ggsave(file.path(base_path, "ROut", "shap_myeloid_comparison.png"), plot = p_myeloid_compare, width = 16, height = 6)
+```
+```{r}
+# Plot FOXP3 expression vs its SHAP value, color-coded by the lymphoid marker CD3
+p_treg_threshold <- sv_dependence(
+  shp_bundle$Treg, 
+  v = "FOXP3", 
+  color_var = "CD3"
+) +
+  theme_bw() +
+  labs(
+    title = "FOXP3 Activation Threshold for Treg Classification",
+    subtitle = "Points above 0 show where FOXP3 confirms a Treg identity",
+    x = "FOXP3 Expression Intensity (asinh)",
+    y = "SHAP Value (Impact on Treg Prediction)"
+  )
+
+p_treg_threshold
+
+ggsave(file.path(base_path, "ROut", "shap_treg_foxp3_threshold.png"), plot = p_treg_threshold, width = 6, height = 5)
+```
