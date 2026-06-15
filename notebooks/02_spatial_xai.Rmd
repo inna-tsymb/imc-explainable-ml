@@ -1,0 +1,410 @@
+---
+title: "02_spatial_xai"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+This notebook asks whether **spatial context** influences cell identity — and whether the XGBoost classifier implicitly captures it.
+
+Questions answered:
+
+1. Which cell-type pairs are spatially enriched or depleted relative to chance?
+2. Do cells with the same marker expression but different neighbourhoods receive different labels?
+3. Is CD8+ T cell proximity to Tumour cells detectable at the population level?
+4. How much does adding neighbourhood composition as features change classifier predictions?
+
+Technically: `imcRtools::buildSpatialGraph()` → `countInteractions()` → `testInteractions()` + neighbourhood feature augmentation.
+
+---
+
+## Libraries
+
+```{r libraries}
+library(imcRtools)
+library(SpatialExperiment)
+library(SingleCellExperiment)
+library(SummarizedExperiment)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(patchwork)
+library(ComplexHeatmap)
+library(circlize)
+library(viridis)
+library(xgboost)
+```
+
+---
+
+## Load labelled SPE
+
+Loads the compensated, labelled SPE produced by `01_read_data.Rmd`.
+Only cells with a confirmed label are kept — unlabelled cells have no ground truth for interaction analysis.
+
+```{r load-spe}
+base_path <- file.path(
+  path.expand("~"),
+  "Desktop",
+  "KSE_Bioinformatics",
+  "Protomics",
+  "XGBoost_classifier",
+  "XGBoost_classifier",
+  "Panel_2_10"
+)
+
+plots_dir <- file.path(dirname(base_path), "plots")
+dir.create(plots_dir, showWarnings = FALSE, recursive = TRUE)
+
+spe <- readRDS(file.path(base_path, "ROut", "spe_labeled.rds"))
+
+# drop residual NAs
+spe <- spe[, !is.na(spe$cell_labels)]
+
+# drop images with too few labelled cells for meaningful spatial analysis
+# (images with < 50 labelled cells are manual-gate slivers — not spatially informative)
+cell_counts   <- table(spe$sample_id)
+keep_imgs     <- names(cell_counts[cell_counts >= 50])
+dropped_imgs  <- names(cell_counts[cell_counts < 50])
+if (length(dropped_imgs)) {
+  cat("Dropping", length(dropped_imgs), "images with < 50 labelled cells:\n")
+  print(sort(cell_counts[dropped_imgs]))
+}
+spe <- spe[, spe$sample_id %in% keep_imgs]
+spe$sample_id <- droplevels(factor(spe$sample_id))
+
+cat("\nCells:", ncol(spe), "\n")
+cat("Images:", length(unique(spe$sample_id)), "\n")
+cat("Cell types:\n")
+print(table(spe$cell_labels))
+```
+
+---
+
+## Build spatial neighbour graph
+
+`buildSpatialGraph()` links each cell to all cells within 15 µm (matching the steinbock `--dmax 15` parameter). This replicates the steinbock neighbour graph from coordinates stored in the SPE, avoiding the file-count mismatch in `neighbors/`.
+
+```{r build-graph}
+spe <- buildSpatialGraph(
+  spe,
+  img_id    = "sample_id",
+  type      = "expansion",
+  threshold = 15,        # µm, matches steinbock --dmax 15
+  coords    = c("Pos_X", "Pos_Y"),
+  BPPARAM   = BiocParallel::SerialParam()
+)
+
+# confirm graph was added
+colPairNames(spe)
+```
+
+
+```{r}
+spatialCoords(spe)      # should show centroid columns
+spatialCoordsNames(spe) # column names
+```
+
+---
+
+## Cell-type interaction counts
+
+`countInteractions()` counts, per image, how often each pair of cell types are direct neighbours.
+`testInteractions()` runs a permutation test (label-shuffling within each image) to identify pairs that co-occur more or less than expected by chance.
+
+```{r count-interactions}
+out_count <- countInteractions(
+  spe,
+  group_by      = "sample_id",
+  label         = "cell_labels",
+  colPairName   = "neighborhood",
+  method        = "classic"
+)
+
+head(out_count)
+```
+
+```{r test-interactions}
+out_test <- testInteractions(
+  spe,
+  group_by      = "sample_id",
+  label         = "cell_labels",
+  colPairName   = "neighborhood",
+  method        = "classic",
+  iter          = 200,    # permutations per image; raise to 1000 for final run
+  BPPARAM       = BiocParallel::SerialParam()
+)
+
+head(out_test)
+```
+
+---
+
+## Interaction heatmap
+
+Mean interaction score across images. Positive = enriched co-localisation; negative = spatial avoidance.
+
+```{r interaction-heatmap, fig.width=10, fig.height=9}
+# testInteractions() returns a Bioconductor DataFrame; convert before dplyr
+out_test_df <- as.data.frame(out_test)
+
+# aggregate mean z-score per pair across images (zscore = numeric enrichment score)
+agg <- out_test_df |>
+  group_by(from_label, to_label) |>
+  summarise(mean_zscore = mean(zscore, na.rm = TRUE), .groups = "drop")
+
+# pivot to matrix
+mat <- agg |>
+  pivot_wider(names_from = to_label, values_from = mean_zscore, values_fill = 0) |>
+  tibble::column_to_rownames("from_label") |>
+  as.matrix()
+
+# symmetrise into square matrix covering all cell types
+all_types <- union(rownames(mat), colnames(mat))
+mat_sq <- matrix(0, nrow = length(all_types), ncol = length(all_types),
+                 dimnames = list(all_types, all_types))
+mat_sq[rownames(mat), colnames(mat)] <- mat
+
+z_lim   <- max(abs(mat_sq), na.rm = TRUE)
+col_fun <- colorRamp2(c(-z_lim, 0, z_lim), c("#2166AC", "white", "#D6604D"))
+```
+
+```{r}
+hm_interactions <- Heatmap(
+  mat_sq,
+  name            = "Interaction\nscore",
+  col             = col_fun,
+  cluster_rows    = TRUE,
+  cluster_columns = TRUE,
+  row_names_gp    = gpar(fontsize = 9),
+  column_names_gp = gpar(fontsize = 9),
+  column_title    = "Cell-type spatial interaction scores (mean across images)"
+)
+png(file.path(plots_dir, "s01_interaction_heatmap.png"),
+    width = 10, height = 9, units = "in", res = 150)
+draw(hm_interactions)
+dev.off()
+hm_interactions
+```
+
+---
+
+## CD8 — Tumour proximity
+
+Focused look at whether CD8+ T cells are closer to Tumour cells than expected by chance, image by image.
+
+```{r cd8-tumor-proximity, fig.width=7, fig.height=4}
+cd8_tumor <- out_test_df |>
+  filter((from_label == "CD8" & to_label == "Tumor") |
+         (from_label == "Tumor" & to_label == "CD8"))
+
+p_cd8_tumor <- ggplot(cd8_tumor, aes(x = zscore)) +
+  geom_histogram(bins = 20, fill = "#2166AC", colour = "white") +
+  geom_vline(xintercept = 0, linetype = "dashed", colour = "red") +
+  facet_wrap(~paste(from_label, "→", to_label)) +
+  labs(
+    title = "CD8 ↔ Tumour interaction z-score across images",
+    x     = "Z-score (positive = enriched co-localisation)",
+    y     = "Number of images"
+  ) +
+  theme_bw()
+p_cd8_tumor
+ggsave(file.path(plots_dir, "s02_cd8_tumor_proximity.png"), p_cd8_tumor,
+       width = 7, height = 4, dpi = 150)
+```
+
+---
+
+## Neighbourhood composition per cell
+
+For each cell, compute the fraction of each cell type among its direct neighbours. These become additional "spatial" features that can be compared to marker-based features.
+
+```{r neighbourhood-composition}
+# retrieve the graph edges; colPair() (singular) returns a SelfHits object
+# S4Vectors::from()/to() are the stable accessors (avoid @from/@to slot access)
+graph    <- colPair(spe, type = "neighborhood")
+from_idx <- S4Vectors::from(graph)
+to_idx   <- S4Vectors::to(graph)
+
+# cell types of the target cells
+to_labels <- spe$cell_labels[to_idx]
+
+# use sample_id + ObjectNumber as the unique cell key (no cell_id column in colData)
+cd <- as.data.frame(colData(spe))
+cd$cell_key <- paste0(cd$sample_id, "_", cd$ObjectNumber)
+
+from_keys <- cd$cell_key[from_idx]
+
+# count neighbour cell types per source cell
+neigh_df <- data.frame(
+  cell_key   = from_keys,
+  neigh_type = to_labels,
+  stringsAsFactors = FALSE
+)
+
+# fraction of each type per cell
+neigh_comp <- neigh_df |>
+  group_by(cell_key, neigh_type) |>
+  summarise(n = n(), .groups = "drop") |>
+  group_by(cell_key) |>
+  mutate(frac = n / sum(n)) |>
+  ungroup() |>
+  select(cell_key, neigh_type, frac) |>
+  pivot_wider(names_from = neigh_type, values_from = frac,
+              values_fill = 0, names_prefix = "neigh_")
+
+# attach to colData
+cd <- left_join(cd, neigh_comp, by = "cell_key")
+```
+
+---
+
+## Do same-marker cells with different neighbours get different labels?
+
+This is the core spatial XAI question. We take cells that are similar in marker expression (same predicted cell type from marker-only model) and ask whether their neighbourhood composition differs by ground-truth label.
+
+```{r marker-vs-spatial, fig.width=10, fig.height=5}
+# use exprs assay (compensated, asinh-transformed)
+expr_mat <- t(assay(spe, "exprs"))
+
+# exclude DNA/Histone from marker features (same as XGBoost training)
+exclude_markers <- c("DNA1", "DNA2", "HistoneH3")
+keep_markers    <- !rownames(spe) %in% exclude_markers
+expr_mat        <- expr_mat[, keep_markers]
+
+# join with neighbourhood composition
+xai_df <- cbind(
+  as.data.frame(expr_mat),
+  cd[match(paste0(spe$sample_id, "_", spe$ObjectNumber), cd$cell_key), grep("^neigh_", names(cd))]
+)
+xai_df$cell_labels <- spe$cell_labels
+
+# for each cell type: how much does neighbourhood composition vary?
+neigh_cols <- grep("^neigh_", names(xai_df), value = TRUE)
+
+neigh_var <- xai_df |>
+  group_by(cell_labels) |>
+  summarise(
+    across(all_of(neigh_cols),
+           list(mean = ~mean(.x, na.rm = TRUE),
+                sd   = ~sd(.x, na.rm = TRUE))),
+    .groups = "drop"
+  )
+```
+
+```{r}
+# plot mean neighbourhood fraction of Tumour neighbours per cell type
+if ("neigh_Tumor" %in% names(xai_df)) {
+  p_tumor_neigh <- ggplot(xai_df, aes(x = reorder(cell_labels, neigh_Tumor, median),
+                     y = neigh_Tumor)) +
+    geom_boxplot(outlier.size = 0.3, fill = "#E8E8E8") +
+    labs(
+      title = "Fraction of Tumour neighbours by cell type",
+      x     = "Cell type",
+      y     = "Fraction of direct neighbours that are Tumour"
+    ) +
+    theme_bw() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+  p_tumor_neigh
+  ggsave(file.path(plots_dir, "s03_tumor_neighbour_fraction.png"), p_tumor_neigh,
+         width = 10, height = 5, dpi = 150)
+}
+```
+
+---
+
+## Spatial feature importance — augmented XGBoost
+
+Train a second XGBoost model that includes neighbourhood composition features and compare feature importance to the marker-only model. This directly answers: "does spatial context add information beyond markers?"
+
+```{r load-classifier}
+meta               <- readRDS(file.path(base_path, "ROut", "classifier_xgboost_meta.rds"))
+model_markers_only <- readRDS(file.path(base_path, "ROut", "classifier_xgboost.rds"))
+```
+
+```{r augmented-model, fig.width=9, fig.height=6}
+# build augmented feature matrix: markers + neighbour fractions
+spe_keys  <- paste0(spe$sample_id, "_", spe$ObjectNumber)
+neigh_mat <- as.matrix(cd[match(spe_keys, cd$cell_key), neigh_cols])
+neigh_mat[is.na(neigh_mat)] <- 0
+
+X_markers   <- t(assay(spe, "exprs"))[, meta$feature_names]
+X_augmented <- cbind(X_markers, neigh_mat)
+
+y <- as.integer(factor(spe$cell_labels, levels = meta$label_mapping)) - 1L
+
+dtrain_aug <- xgb.DMatrix(data = X_augmented, label = y)
+
+params_aug <- list(
+  objective        = "multi:softprob",
+  num_class        = length(meta$label_mapping),
+  eta              = meta$params$eta,
+  max_depth        = meta$params$max_depth,
+  subsample        = meta$params$subsample,
+  colsample_bytree = meta$params$colsample_bytree,
+  eval_metric      = "mlogloss"
+)
+
+set.seed(42)
+model_aug <- xgb.train(
+  params  = params_aug,
+  data    = dtrain_aug,
+  nrounds = meta$nrounds,
+  verbose = 0
+)
+
+# feature importance: augmented model
+imp_aug <- xgb.importance(model = model_aug)
+
+# split into marker vs spatial features
+imp_aug$feature_type <- ifelse(
+  grepl("^neigh_", imp_aug$Feature), "Spatial (neighbour)", "Marker"
+)
+
+p_aug_imp <- ggplot(imp_aug |> slice_max(Gain, n = 30),
+       aes(x = reorder(Feature, Gain), y = Gain, fill = feature_type)) +
+  geom_col() +
+  coord_flip() +
+  scale_fill_manual(values = c("Marker" = "#4393C3", "Spatial (neighbour)" = "#D6604D")) +
+  labs(
+    title = "Top 30 features — augmented model (markers + neighbourhood)",
+    x     = NULL,
+    y     = "Gain",
+    fill  = "Feature type"
+  ) +
+  theme_bw()
+p_aug_imp
+ggsave(file.path(plots_dir, "s04_augmented_feature_importance.png"), p_aug_imp,
+       width = 9, height = 6, dpi = 150)
+```
+
+---
+
+## Summary
+
+```{r summary}
+cat("=== Spatial XAI Summary ===\n\n")
+
+cat("Interaction test: cell-type pairs with significant co-localisation:\n")
+sig_pairs <- out_test_df |>
+  group_by(from_label, to_label) |>
+  summarise(
+    mean_zscore      = mean(zscore, na.rm = TRUE),
+    frac_enriched    = mean(interaction == TRUE, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  filter(abs(mean_zscore) > 1) |>
+  arrange(desc(abs(mean_zscore)))
+
+print(sig_pairs)
+```
+
+```{r summary}
+cat("\nSpatial feature contribution in augmented model:\n")
+spatial_gain <- imp_aug |>
+  group_by(feature_type) |>
+  summarise(total_gain = sum(Gain), .groups = "drop") |>
+  mutate(pct = round(100 * total_gain / sum(total_gain), 1))
+print(spatial_gain)
+```
