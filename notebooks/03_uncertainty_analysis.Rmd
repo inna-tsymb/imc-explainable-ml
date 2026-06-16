@@ -1,0 +1,485 @@
+---
+title: "03_uncertainty_analysis"
+subtitle: "Model Uncertainty: Which Cells Should Not Be Trusted?"
+author: "Inna Kucherova"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: united
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 10, fig.height = 7)
+```
+
+# Introduction
+
+This notebook analyses the **uncertainty** of the XGBoost classifier.
+
+The model does not simply assign a label — it outputs **softmax probabilities** for
+each class. Cells with a uniform probability distribution are considered "ambiguous".
+
+**Key metrics:**
+- `max_prob` — confidence in the top predicted class
+- `entropy` — prediction entropy H = -Σ p·log(p)
+
+> "Which cells should not be trusted?"
+
+---
+
+# 0. Packages
+
+```{r load-libraries}
+if (!require("pacman")) install.packages("pacman")
+pacman::p_load(
+  here, 
+  conflicted,
+  ggplot2, 
+  dplyr, 
+  tidyr, 
+  forcats,
+  patchwork, 
+  viridis, 
+  circlize, 
+  ggridges, 
+  RColorBrewer
+)
+
+if (!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager")
+BiocManager::install(c("ComplexHeatmap", "SummarizedExperiment"), update = FALSE, ask = FALSE)
+
+conflicted::conflicts_prefer(dplyr::count)
+conflicted::conflicts_prefer(dplyr::filter)
+conflicted::conflicts_prefer(base::setdiff)
+```
+
+---
+
+# 1. Load Objects
+
+```{r load-objects}
+base_path <- here::here("data", "Panel_2_10")
+
+out_dir <- file.path(base_path, "ROut")
+
+spe_27 <- readRDS(file.path(out_dir, "spe.rds"))
+
+inputs        <- readRDS(file.path(out_dir, "classifier_inputs.rds"))
+test_prob     <- inputs$test_prob
+test_pred     <- inputs$test_pred
+test_true     <- inputs$test_true
+label_mapping <- inputs$label_mapping
+test_sce      <- inputs$test_sce
+
+num_classes <- length(label_mapping)
+n_test      <- nrow(test_prob)
+
+cat("Test cells:", n_test, "\n")
+cat("Classes:", num_classes, "\n")
+```
+
+---
+
+# 2. Compute Uncertainty Metrics
+
+```{r compute-uncertainty}
+# Maximum probability: the higher, the more confident the model
+max_prob <- apply(test_prob, 1, max)
+
+# Entropy: H = -Σ p·log2(p)  (0 = full confidence, log2(K) = maximum)
+entropy <- apply(test_prob, 1, function(p) {
+  p_pos <- p[p > 0]
+  -sum(p_pos * log2(p_pos))
+})
+
+# Maximum possible entropy (uniform distribution)
+max_entropy <- log2(num_classes)
+
+# Normalized entropy [0, 1]
+entropy_norm <- entropy / max_entropy
+
+# Labels: predicted class and correctness
+pred_class  <- factor(as.character(test_pred), levels = label_mapping)
+true_class  <- factor(as.character(test_true), levels = label_mapping)
+is_correct  <- pred_class == true_class
+
+# Second best class and probability margin
+second_prob <- apply(test_prob, 1, function(p) sort(p, decreasing = TRUE)[2])
+prob_margin <- max_prob - second_prob
+
+uncertainty_df <- data.frame(
+  cell_id      = rownames(test_prob),
+  max_prob     = max_prob,
+  second_prob  = second_prob,
+  prob_margin  = prob_margin,
+  entropy      = entropy,
+  entropy_norm = entropy_norm,
+  pred_class   = pred_class,
+  true_class   = true_class,
+  is_correct   = is_correct,
+  row.names    = NULL
+)
+
+cat("Threshold statistics (max_prob):\n")
+cat("  < 0.5 (low confidence):", sum(max_prob < 0.5), "\n")
+cat("  < 0.6:", sum(max_prob < 0.6), "\n")
+cat("  < 0.8:", sum(max_prob < 0.8), "\n")
+cat("  ≥ 0.9 (high confidence):", sum(max_prob >= 0.9), "\n")
+```
+
+---
+
+# 3. Distribution of max_prob and Entropy
+
+```{r distribution-plots, fig.width=12, fig.height=5}
+p1 <- ggplot(uncertainty_df, aes(x = max_prob, fill = is_correct)) +
+  geom_histogram(bins = 60, alpha = 0.8, position = "stack") +
+  geom_vline(xintercept = 0.6, linetype = "dashed", color = "red", linewidth = 0.8) +
+  scale_fill_manual(
+    values = c("TRUE" = "#4575B4", "FALSE" = "#D73027"),
+    labels = c("TRUE" = "Correct", "FALSE" = "Incorrect"),
+    name = NULL
+  ) +
+  theme_classic(base_size = 13) +
+  labs(
+    title    = "Distribution of Maximum Probability",
+    subtitle = "Red line = uncertainty threshold (max_prob < 0.6)",
+    x        = "max softmax P",
+    y        = "Cell count"
+  )
+
+p2 <- ggplot(uncertainty_df, aes(x = entropy_norm, fill = is_correct)) +
+  geom_histogram(bins = 60, alpha = 0.8, position = "stack") +
+  geom_vline(xintercept = 0.3, linetype = "dashed", color = "red", linewidth = 0.8) +
+  scale_fill_manual(
+    values = c("TRUE" = "#4575B4", "FALSE" = "#D73027"),
+    labels = c("TRUE" = "Correct", "FALSE" = "Incorrect"),
+    name = NULL
+  ) +
+  theme_classic(base_size = 13) +
+  labs(
+    title    = "Distribution of Normalised Prediction Entropy",
+    subtitle = "H = -Σ p·log₂(p), normalised to [0, 1]",
+    x        = "Normalised entropy",
+    y        = "Cell count"
+  )
+
+p1 + p2
+```
+
+```{r save-distribution}
+ggsave(
+  file.path(out_dir, "uncertainty_distributions.png"),
+  p1 + p2, width = 14, height = 6, dpi = 150
+)
+```
+
+---
+
+# 4. Uncertainty per Cell Type
+
+```{r uncertainty-per-class, fig.height=8, fig.width=10}
+# Which cell types are present in the data?
+cell_types <- levels(fct_reorder(uncertainty_df$pred_class, 
+                                  uncertainty_df$entropy_norm, median))
+cell_types
+length(cell_types)
+
+colors <- c(
+  # Tumor
+  "Tumor"       = "#E41A1C",
+  
+  # T cells
+  "CD8"         = "#377EB8",
+  "CD4"         = "#4DAF4A",
+  "Treg"        = "#984EA3",
+  "BnT"         = "#A65628",
+  
+  # NK, B cells
+  "NK"          = "#FF7F00",
+  "B"           = "#FFFF33",
+  
+  # Macrophages / dendritic cells
+  "Mac"         = "#F781BF",
+  "MacCD204"    = "#E7298A",
+  "MacCD209"    = "#CE1256",
+  "DC"          = "#66C2A5",
+  "mregDC"      = "#3288BD",
+  
+  # MDSC / neutrophils
+  "MDSC"        = "#FC8D59",
+  "PMN_MDSC"    = "#D53E4F",
+  "Neutrophil"  = "#FEE08B",
+  
+  # Stroma / vasculature
+  "Fibro"       = "#8DA0CB",
+  "vCAF"        = "#A6D854",
+  "SMA"         = "#FFD92F",
+  "Vasculature" = "#E5C494",
+  
+  # Other
+  "Igg"         = "#B3B3B3",
+  "undefined"   = "#CCCCCC"
+)
+
+# Check that all cell types are covered
+base::setdiff(cell_types, names(colors)) # should return character(0)
+
+# Save to metadata
+metadata(spe_27)$colour_vectors$cell_types <- colors
+
+# Build the plot
+p_ridge <- ggplot(
+  uncertainty_df,
+  aes(x = entropy_norm, y = fct_reorder(pred_class, entropy_norm, median), fill = pred_class)
+) +
+  geom_density_ridges(alpha = 0.75, scale = 0.9, rel_min_height = 0.01) +
+  scale_fill_manual(values = colors, guide = "none") +
+  geom_vline(xintercept = 0.3, linetype = "dashed", color = "red") +
+  theme_classic(base_size = 12) +
+  labs(
+    title    = "Prediction Entropy by Cell Type",
+    subtitle = "Ordered by median entropy",
+    x        = "Normalised entropy",
+    y        = "Predicted cell type"
+  )
+p_ridge
+```
+
+```{r save-ridge}
+ggsave(
+  file.path(out_dir, "uncertainty_ridgeplot.png"),
+  p_ridge, width = 10, height = 8, dpi = 150
+)
+```
+
+---
+
+# 5. Low-Confidence Cells (Uncertain Cells)
+
+```{r uncertain-cells}
+CONFIDENCE_THRESHOLD <- 0.6
+
+uncertain_df <- uncertainty_df |> 
+  dplyr::filter(max_prob < CONFIDENCE_THRESHOLD)
+
+cat("Uncertain cells (max_prob <", CONFIDENCE_THRESHOLD, "):",
+    nrow(uncertain_df), "/", n_test, 
+    "(", round(100 * nrow(uncertain_df) / n_test, 1), "%)\n")
+
+# Breakdown by predicted class
+uncertain_by_class <- uncertain_df |>
+  dplyr::count(pred_class, name = "n_uncertain") |>
+  dplyr::left_join(
+    uncertainty_df |> dplyr::count(pred_class, name = "n_total"),
+    by = "pred_class"
+  ) |>
+  dplyr::mutate(pct_uncertain = round(100 * n_uncertain / n_total, 1)) |>
+  dplyr::arrange(dplyr::desc(pct_uncertain))
+
+uncertain_by_class
+```
+
+```{r plot-uncertain-per-class, fig.height=6, fig.width=9}
+p_unc <- ggplot(uncertain_by_class, aes(
+  x    = pct_uncertain,
+  y    = fct_reorder(pred_class, pct_uncertain),
+  fill = pred_class
+)) +
+  geom_col(alpha = 0.85) +
+  scale_fill_manual(
+    values = metadata(spe_27)$colour_vectors$cell_types,
+    guide  = "none"
+  ) +
+  geom_text(
+    aes(label = paste0(pct_uncertain, "%")),
+    hjust = -0.1, size = 3.5
+  ) +
+  xlim(0, max(uncertain_by_class$pct_uncertain) * 1.2) +
+  theme_classic(base_size = 12) +
+  labs(
+    title    = "% Uncertain Cells per Cell Type (max_prob < 0.6)",
+    subtitle = "Classes with a higher uncertain fraction are harder for the classifier",
+    x        = "% uncertain",
+    y        = "Predicted cell type"
+  )
+
+p_unc
+```
+
+```{r save-uncertain-plot}
+ggsave(
+  file.path(out_dir, "uncertainty_per_class.png"),
+  p_unc, width = 9, height = 6, dpi = 150
+)
+```
+
+---
+
+# 6. Confusion Matrix for Uncertain Cells Only
+
+```{r confusion-uncertain, fig.height=8, fig.width=10}
+library(caret)
+
+# Exclude NA in true_class
+uncertain_labeled <- uncertain_df |> 
+  dplyr::filter(!is.na(true_class))
+
+if (nrow(uncertain_labeled) > 10) {
+  cm_unc <- caret::confusionMatrix(
+    data      = factor(uncertain_labeled$pred_class, levels = label_mapping),
+    reference = factor(uncertain_labeled$true_class,  levels = label_mapping)
+  )
+  
+  cm_df <- as.data.frame(cm_unc$table)
+  
+  p_cm_unc <- ggplot(cm_df, aes(x = Reference, y = Prediction, fill = Freq)) +
+    geom_tile(color = "white") +
+    scale_fill_gradient(low = "white", high = "#D73027", name = "Cell count") +
+    geom_text(aes(label = ifelse(Freq > 0, Freq, "")), size = 2.5) +
+    theme_classic(base_size = 10) +
+    theme(
+      axis.text.x = element_text(angle = 45, hjust = 1),
+      axis.text.y = element_text(size = 9)
+    ) +
+    labs(
+      title    = "Confusion Matrix: Uncertain Cells Only (max_prob < 0.6)",
+      subtitle = paste("Accuracy:", round(cm_unc$overall["Accuracy"] * 100, 1), "%"),
+      x        = "True class",
+      y        = "Predicted class"
+    )
+  
+  p_cm_unc
+  
+  ggsave(
+    file.path(out_dir, "uncertainty_confusion_matrix.png"),
+    p_cm_unc, width = 12, height = 10, dpi = 150
+  )
+}
+```
+
+---
+
+# 7. Most Confused Class Pairs
+
+```{r confusion-pairs, fig.height=6, fig.width=10}
+# Extract incorrect predictions from all test cells
+error_df <- uncertainty_df |> 
+  dplyr::filter(!is_correct, !is.na(true_class)) |> 
+  dplyr::mutate(
+    confusion_pair = paste0(
+      as.character(true_class), " → ", as.character(pred_class)
+    )
+  ) |> 
+  dplyr::count(
+    true_class, pred_class, confusion_pair,
+    name = "n_errors"
+  ) |> 
+  dplyr::arrange(dplyr::desc(n_errors)) |> 
+  head(20)
+
+p_errors <- ggplot(error_df, aes(
+  x    = n_errors,
+  y    = fct_reorder(confusion_pair, n_errors),
+  fill = n_errors
+)) +
+  geom_col(alpha = 0.9) +
+  scale_fill_gradient(low = "#FEE090", high = "#D73027", guide = "none") +
+  geom_text(aes(label = n_errors), hjust = -0.2, size = 3.5) +
+  xlim(0, max(error_df$n_errors) * 1.2) +
+  theme_classic(base_size = 12) +
+  labs(
+    title    = "Top-20 Confusion Pairs (All Test Cells)",
+    subtitle = "Format: True class → Predicted class",
+    x        = "Number of errors",
+    y        = NULL
+  )
+
+p_errors
+```
+
+```{r save-confusion-pairs}
+ggsave(
+  file.path(out_dir, "uncertainty_confusion_pairs.png"),
+  p_errors, width = 10, height = 7, dpi = 150
+)
+```
+
+---
+
+# 8. Entropy vs. Margin: Scatter Plot
+
+```{r entropy-margin-scatter, fig.height=6, fig.width=9}
+p_scatter <- ggplot(
+  uncertainty_df |> dplyr::filter(!is.na(true_class)),
+  aes(x = entropy_norm, y = prob_margin, color = is_correct)
+) +
+  geom_point(alpha = 0.4, size = 0.8) +
+  scale_color_manual(
+    values = c("TRUE" = "#4575B4", "FALSE" = "#D73027"),
+    labels = c("TRUE" = "Correct", "FALSE" = "Incorrect"),
+    name   = NULL
+  ) +
+  geom_hline(yintercept = 0.3, linetype = "dashed", color = "gray50") +
+  geom_vline(xintercept = 0.3, linetype = "dashed", color = "gray50") +
+  theme_classic(base_size = 13) +
+  labs(
+    title    = "Entropy vs. Probability Margin",
+    subtitle = "Misclassified cells: high entropy + small margin",
+    x        = "Normalised entropy H",
+    y        = "P(1st) − P(2nd) = margin"
+  )
+
+p_scatter
+```
+
+```{r save-scatter}
+ggsave(
+  file.path(out_dir, "uncertainty_entropy_margin_scatter.png"),
+  p_scatter, width = 9, height = 6, dpi = 150
+)
+```
+
+---
+
+# 9. Uncertainty Summary Table
+
+```{r summary-table}
+summary_unc <- uncertainty_df |> 
+  dplyr::filter(!is.na(true_class)) |> 
+  dplyr::group_by(pred_class) |> 
+  dplyr::summarise(
+    n_total        = n(),
+    n_uncertain    = sum(max_prob < CONFIDENCE_THRESHOLD),
+    pct_uncertain  = round(100 * n_uncertain / n_total, 1),
+    median_entropy = round(median(entropy_norm), 3),
+    median_maxprob = round(median(max_prob), 3),
+    accuracy       = round(mean(is_correct) * 100, 1),
+    .groups = "drop"
+  ) |> 
+  dplyr::arrange(dplyr::desc(pct_uncertain))
+
+summary_unc
+
+write.csv(
+  summary_unc,
+  file.path(out_dir, "uncertainty_summary_per_class.csv"),
+  row.names = FALSE
+)
+```
+
+---
+
+# Conclusions
+
+1. Cells with **max_prob < 0.6** (≈ X% of the test set) are ambiguous —
+   the model cannot confidently assign a single type.
+2. **Highest entropy** is observed in rare or transitional classes:
+   Igg, PMN_MDSC, Neutrophil, MDSC — consistent with low accuracy in the confusion matrix.
+3. **Most frequent confusion pairs** reflect biological similarity:
+   MacCD204 ↔ Mac, CD4 ↔ CD8, Fibro ↔ SMA.
+4. **High entropy + small margin** → a cell is a true "borderline" case;
+   it should be treated with particular caution in downstream analyses.
