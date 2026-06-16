@@ -755,6 +755,8 @@ print(res$summary)
 ```{r}
 test_sce <- lab_sce[, lab_sce$sample_id %in% res$test_rownames]
 train_sce <- lab_sce[, lab_sce$sample_id %in% res$train_rownames]
+
+saveRDS(train_sce, file.path(base_path, "ROut", "train_sce.rds"))
 ```
 
 
@@ -1626,10 +1628,11 @@ final_model <- xgboost::xgb.train(
 save final model via saveRDS
 
 ```{r train-final-model, message = FALSE, eval = TRUE}
-# saveRDS(
-#   final_model,
-#   file = file.path(base_path, "classifier_xgboost.rds")
-# )
+saveRDS(
+  final_model,
+  file = file.path(base_path, "classifier_xgboost.rds")
+ )
+
 ```
 
 
