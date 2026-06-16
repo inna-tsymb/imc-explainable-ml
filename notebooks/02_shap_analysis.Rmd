@@ -199,7 +199,7 @@ ggsave(
 )
 ```
 
-## A. Myeloid Differentiation: MacCD204 vs. MacCD209
+## Myeloid Differentiation: MacCD204 vs. MacCD209
 We look at the top macrophage/dendritic subsets to understand how the model draws sharp boundaries between closely related myeloid phenotypes.
 ```{r shap-myeloid-dynamics, fig.height=6, fig.width=18}
 p_mac204 <- plot_cell_type_shap(shp_bundle, "MacCD204", top_n = 10) +
@@ -214,6 +214,7 @@ p_myeloid_compare
 
 ggsave(file.path(base_path, "ROut", "shap_myeloid_comparison.png"), plot = p_myeloid_compare, width = 16, height = 6)
 ```
+## Lymphoid Threshold: FOXP3 Activation in Tregs
 ```{r}
 # Plot FOXP3 expression vs its SHAP value, color-coded by the lymphoid marker CD3
 p_treg_threshold <- sv_dependence(
@@ -231,5 +232,5 @@ p_treg_threshold <- sv_dependence(
 
 p_treg_threshold
 
-ggsave(file.path(base_path, "ROut", "shap_treg_foxp3_threshold.png"), plot = p_treg_threshold, width = 6, height = 5)
+ggsave(file.path(base_path, "ROut", "shap_treg_foxp3_threshold.png"), plot = p_treg_threshold, width = 16, height = 9)
 ```
