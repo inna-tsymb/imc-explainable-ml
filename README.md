@@ -46,7 +46,7 @@ data and then interrogated through four complementary XAI lenses:
 ├── notebooks/
 │   ├── 01_read_data.Rmd              # Preprocessing, spillover, gating, XGBoost CV + final model
 │   ├── 01b_save_shared_objects.Rmd   # Saves shared RDS objects for notebooks 02–05
-│   ├── 02_shap_analysis.Rmd          # SHAP values, beeswarm, waterfall, interaction plots
+│   ├── 02_shap_analysis.Rmd          # SHAP values, feature importance bar chart, beeswarm, interaction plots
 │   ├── 03_uncertainty_analysis.Rmd   # Softmax entropy, per-class uncertainty, confusion pairs
 │   ├── 04_spatial_xai.Rmd            # Spatial graph, neighbour composition, cell interactions
 │   └── 05_<...>.Rmd  # Unseen data analysis and validation, PCA/UMAP of images, TME subtypes, outlier detection
@@ -160,13 +160,16 @@ install.packages(c(
 | `07_RAW_Proportions_Per_Image.pdf` | Proportions of predicted cell types per image |
 | `08_CLEAN_CLR_Phenotype_Heatmap.pdf` | CLR-transforme predicted cell types per image, displayed on heatmap to see presence of sample-level connections  |
 | `09_PCA_Anomaly_Map.pdf` | Visualization of outliers detection (sample-level) for further analysis  |
-
-#TODO check what relevant after here
-| `shap_global_importance.png` | Global mean \|SHAP\| bar chart |
-| `shap_beeswarm_global.png` | SHAP beeswarm — all test cells |
-| `shap_beeswarm_per_class.png` | Per-class beeswarm (CD8, CD4, Tumor, …) |
+| `shap_global_importance.png` | Bar chart that shows the importance of markers for each cell type |
+| `shap_beeswarm_global.png` | SHAP beeswarm — summary of how a XGBoost makes decisions across all test cells |
 | `shap_class_heatmap.png` | Marker × cell-type SHAP heatmap |
 | `shap_interaction_CD3_CD8a.png` | CD3 × CD8a dependence plot |
+| `shap_myeloid_comparison.png` | Comparison of the contribution of markers to distinguishing between MacCD204 and MacCD209 |
+| `shap_treg_foxp3_threshold.png` | Representation of how the model determines the structural identity of Tregs using a combination of the FOXP3 and CD3 markers |
+
+
+#TODO check what relevant after here
+
 | `uncertainty_distributions.png` | max_prob and entropy distributions |
 | `uncertainty_ridgeplot.png` | Entropy by cell type (ridge plot) |
 | `uncertainty_confusion_pairs.png` |  Top-20 confusion pairs |
@@ -184,10 +187,10 @@ install.packages(c(
 If you use this code, please cite:
 
 ```
-@misc{imc_xai_crc_2024,
+@misc{imc_xai_crc_2026,
   title  = {Explainable ML for Cellular Phenotyping in Imaging Mass Cytometry},
-  author = {Uliana, Inna , Anna, Oleksandra Tsepilova},
-  year   = {2024},
+  author = {Uliana Krektun, Inna Kucherova, Anna Gurina, Oleksandra Tsepilova},
+  year   = {2026},
   url    = {https://github.com/inna-tsymb/imc-explainable-ml/tree/main}
 }
 ```
