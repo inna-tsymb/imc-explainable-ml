@@ -1,0 +1,144 @@
+---
+title: "Predicting the Unlabelled Cells"
+author: "Oleksandra Tsepilova"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: united
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = TRUE, warning = FALSE)
+```
+
+## Overview
+This script loads the entire compensated dataset, programmatically isolates cells without human annotations, and runs the trained XGBoost model. 
+
+### 1. Load Libraries, Data, and Official Labels
+
+```{r load-data}
+library(SingleCellExperiment)
+library(xgboost)
+library(dplyr)
+library(purrr)
+
+base_path <- file.path(
+  path.expand("."), 
+  "data", 
+  "Panel_2_10"
+)
+
+# Load the full, compensated dataset
+spe <- readRDS(file.path(base_path, "ROut", "spe.rds"))
+
+# Create unique cell IDs across the entire dataset
+spe$cell_id <- paste0(spe$sample_id, "_", spe$ObjectNumber)
+colnames(spe) <- spe$cell_id
+
+# Load the trained model
+final_model <- readRDS(file.path(base_path, "classifier_xgboost.rds"))
+
+# Define the EXACT 21 classes derived from the original training matrix
+official_labels <- c(
+  "B", "BnT", "CD4", "CD8", "DC", "Fibro", "Igg", "Mac", "MacCD204", 
+  "MacCD209", "MDSC", "mregDC", "Neutrophil", "NK", "PMN_MDSC", "SMA", 
+  "Treg", "Tumor", "undefined", "Vasculature", "vCAF"
+)
+```
+
+### 2. Identify and Isolate Unlabelled Cells
+
+We exclude any cell that has a manual gate, as well as the blank image identified during QC.
+
+```{r filter-unseen}
+# Read the manual gate files to find the cells that were already used
+gates <- list.files(
+  file.path(base_path, "gates"), 
+  pattern = "\\.rds$", 
+  full.names = TRUE, 
+  recursive = TRUE
+)
+
+gate_labels <- purrr::map_dfr(gates, function(path) {
+  x <- readRDS(path)
+  data.frame(
+    sample_id = as.character(x$sample_id),
+    ObjectNumber = as.character(x$ObjectNumber),
+    row.names = NULL
+  )
+})
+
+# Reconstruct the cell_ids that have manual annotations
+gated_cell_ids <- paste0(gate_labels$sample_id, "_", gate_labels$ObjectNumber)
+
+# Define the known blank image to drop (known from train script)
+blank_image <- "10123883-USL-VAR-TIS-01-IMC-02_005"
+
+# Subset the SPE object: Keep cells NOT in the gated list, and NOT in the blank image
+unseen_spe <- spe[, !(colnames(spe) %in% gated_cell_ids) & spe$sample_id != blank_image]
+
+message("Total cells in original dataset: ", ncol(spe))
+message("Total unlabelled cells to predict: ", ncol(unseen_spe))
+```
+
+### 3. Format the Feature Matrix
+
+```{r format-matrix}
+# Filter out DNA and Histone markers exactly as done in training
+marker_keep <- !grepl("DNA|Histone", rownames(unseen_spe), ignore.case = TRUE)
+
+# Transpose so cells are rows and markers are columns
+X_unseen <- t(assay(unseen_spe, "exprs")[marker_keep, ])
+
+# Convert to XGBoost DMatrix format
+Xy_unseen <- xgboost::xgb.DMatrix(data = X_unseen)
+```
+
+### 4. Execute Predictions with Dynamic Matrix Reshaping
+
+Here we run the predictions by XGBoost. By checking whether the rows or columns sum to 1, we prevent the data from being scrambled.
+
+```{r predict-labels}
+message("Running XGBoost mass prediction...")
+raw_preds <- predict(final_model, newdata = Xy_unseen)
+
+num_classes <- length(official_labels)
+
+# Test both reshaping directions to find the mathematically valid orientation
+prob_byrow <- matrix(raw_preds, ncol = num_classes, byrow = TRUE)
+prob_bycol <- matrix(raw_preds, ncol = num_classes, byrow = FALSE)
+
+if (mean(abs(rowSums(prob_byrow) - 1)) < mean(abs(rowSums(prob_bycol) - 1))) {
+  prob_matrix <- prob_byrow
+} else {
+  prob_matrix <- prob_bycol
+}
+
+# Safety check: ensure the resulting matrix is structurally sound
+stopifnot(mean(abs(rowSums(prob_matrix) - 1)) < 1e-6)
+
+# Assign the class with the highest probability
+predicted_labels <- factor(
+  official_labels[max.col(prob_matrix, ties.method = "first")],
+  levels = official_labels
+)
+
+# Extract the maximum probability as the confidence score
+prediction_confidence <- apply(prob_matrix, 1, max)
+```
+
+### 5. Append Results and Save
+
+```{r save-results}
+# Save predictions and confidence back to the metadata
+unseen_spe$predicted_label <- predicted_labels
+unseen_spe$prediction_confidence <- prediction_confidence
+
+# Save the final predicted object
+out_file <- file.path(base_path, "ROut", "spe_unseen_predicted.rds")
+saveRDS(unseen_spe, out_file)
+
+message("Predicted SPE saved to: ", out_file)
+```

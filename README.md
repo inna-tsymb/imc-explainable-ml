@@ -18,14 +18,17 @@ data and then interrogated through four complementary XAI lenses:
 | `02_shap_analysis` | **SHAP** | Why did the model assign this cell type? |
 | `03_uncertainty_analysis` | **Uncertainty** | Which cells should we not trust? |
 | `04_spatial_xai` | **Spatial context** | Do neighbours influence the label? |
-| `05_image_composition_xai` | **Image-level** | Which images are typical vs. anomalous? |
+| `05_predict_unlabeled` | **Unlabeled Images** | Obtain prediction for images, that have no manual labels (therefore not present in train or test sets) |
+| `05_visual_model_validation` | **Image-Level** | Check if model predictions visually make sense. Closer attention is paid to tumor and mregDC cell types. |
+| `05_dataset_xgboost_composition_analysis` | **Dataset-Level** | Do predicted cell types make sense composition-wise for this dataset? |
+`05_anomalies_handoff` | **Image-Level** | PCA analysis of samples to understand possible outliers and pass them to other checks.|
 
 ---
 
 ## Dataset
 
 - **Cohort:** Colorectal cancer (CRC) tissue — University Saint-Luc (USL), Brussels
-- **Panel:** Panel_2_10 (~40 protein markers)
+- **Panel:** Panel_2_10 (44 protein markers)
 - **Images:** 27 IMC acquisitions (1 blank image removed after QC)
 - **Cell types (20):** B, BnT, CD4, CD8, Treg, NK, Igg, DC, Mac, MacCD204,
   MacCD209, mregDC, Neutrophil, PMN_MDSC, MDSC, Vasculature, vCAF, Tumor, SMA,
@@ -46,21 +49,9 @@ data and then interrogated through four complementary XAI lenses:
 │   ├── 02_shap_analysis.Rmd          # SHAP values, beeswarm, waterfall, interaction plots
 │   ├── 03_uncertainty_analysis.Rmd   # Softmax entropy, per-class uncertainty, confusion pairs
 │   ├── 04_spatial_xai.Rmd            # Spatial graph, neighbour composition, cell interactions
-│   └── 05_image_composition_xai.Rmd  # PCA/UMAP of images, TME subtypes, outlier detection
-├── data/
-│   └── Panel_2_10/                   # steinbock output (not tracked by git)
-│       ├── img/
-│       ├── masks/
-│       ├── intensities/
-│       ├── regionprops/
-│       ├── neighbors/
-│       ├── compensation/
-│       └── gates/
+│   └── 05_<...>.Rmd  # Unseen data analysis and validation, PCA/UMAP of images, TME subtypes, outlier detection
 ├── results/
-│   ├── figures/                      # PNG outputs from all notebooks
-│   └── tables/                       # CSV summaries
-├── renv.lock                         # Pinned R environment (renv)
-├── .Rprofile                         # Auto-activates renv
+│   └── figures/                       # PNG/PDF and other plots from script
 └── README.md
 ```
 
@@ -83,9 +74,6 @@ steinbock CLI (Python)
   ├── Stratified train/test split (image-level)
   ├── XGBoost grid search (5-fold grouped CV)
   └── Final model → classifier_xgboost.rds
-          ↓
-01b_save_shared_objects.Rmd
-  └── classifier_inputs.rds  (X, test_prob, label_mapping, …)
           ↓
 ┌─────────────────────────────────────────────────┐
 │  02  SHAP          │  03  Uncertainty           │
@@ -136,16 +124,6 @@ steinbock measure neighbors --type centroids --dmax 15
 
 ## Environment Setup
 
-### Option A — renv (recommended)
-
-```r
-# In R, from the project root:
-install.packages("renv")
-renv::restore()   # installs all packages from renv.lock
-```
-
-### Option B — manual install
-
 ```r
 # Bioconductor packages
 if (!requireNamespace("BiocManager", quietly = TRUE))
@@ -167,48 +145,37 @@ install.packages(c(
 ))
 ```
 
-See `renv.lock` for exact pinned versions.
-
----
-
-## Running the Analysis
-
-```r
-# 1. Render the main preprocessing + classifier notebook
-rmarkdown::render("notebooks/01_read_data.Rmd")
-
-# 2. Save shared objects (add this block to 01_read_data.Rmd or run manually)
-rmarkdown::render("notebooks/01b_save_shared_objects.Rmd")
-
-# 3. Run XAI notebooks independently (in any order)
-rmarkdown::render("notebooks/02_shap_analysis.Rmd")
-rmarkdown::render("notebooks/03_uncertainty_analysis.Rmd")
-rmarkdown::render("notebooks/04_spatial_xai.Rmd")
-rmarkdown::render("notebooks/05_image_composition_xai.Rmd")
-```
-
-All figures are saved to `results/figures/` and tables to `results/tables/`.
-
 ---
 
 ## Key Outputs
 
-| File | Notebook | Description |
-|------|----------|-------------|
-| `shap_global_importance.png` | 02 | Global mean \|SHAP\| bar chart |
-| `shap_beeswarm_global.png` | 02 | SHAP beeswarm — all test cells |
-| `shap_beeswarm_per_class.png` | 02 | Per-class beeswarm (CD8, CD4, Tumor, …) |
-| `shap_class_heatmap.png` | 02 | Marker × cell-type SHAP heatmap |
-| `shap_interaction_CD3_CD8a.png` | 02 | CD3 × CD8a dependence plot |
-| `uncertainty_distributions.png` | 03 | max_prob and entropy distributions |
-| `uncertainty_ridgeplot.png` | 03 | Entropy by cell type (ridge plot) |
-| `uncertainty_confusion_pairs.png` | 03 | Top-20 confusion pairs |
-| `spatial_neighbor_composition.png` | 04 | Neighbour composition heatmap |
-| `spatial_cell_interactions.png` | 04 | Cell-cell enrichment (permutation test) |
-| `spatial_uncertainty_map.png` | 04 | Spatial map of prediction entropy |
-| `image_composition_heatmap.png` | 05 | Image × cell-type heatmap |
-| `image_composition_pca.png` | 05 | PCA of image compositions |
-| `image_outlier_detection.png` | 05 | Anomalous images (Mahalanobis distance) |
+| File | Description |
+|------|-------------|
+| `01_Validation_1A_Predicted_TME.pdf` | Visualization of predicted cell types for 2 training and 2 unseen images |
+| `02_Validation_1B_GroundTruth_TME.pdf` | Visualization of ground truth labels for the same 2 training images |
+| `03_Validation_1C_HighContrast_Tumor.pdf` | Visualization of gsame samples but only tumor cells, for validation of tumor shapes |
+| `04_Validation_2A_Predicted_Tumor_Overlay.pdf` | Predicted tumor cells overlayed on top of high-contrast display of panCK and Ecad markers, for marker-cell type validation |
+| `05_Validation_2B_GroundTruth_Tumor_Overlay.pdf` | Same visuals applied to original labels |
+| `06_Validation_3_Predicted_mregDC.pdf` | Predicted mregCD cells overlayed on top of high-contrast display of panCK and Ecad markers, for marker-cell type validation |
+| `07_RAW_Proportions_Per_Image.pdf` | Proportions of predicted cell types per image |
+| `08_CLEAN_CLR_Phenotype_Heatmap.pdf` | CLR-transforme predicted cell types per image, displayed on heatmap to see presence of sample-level connections  |
+| `09_PCA_Anomaly_Map.pdf` | Visualization of outliers detection (sample-level) for further analysis  |
+
+#TODO check what relevant after here
+| `shap_global_importance.png` | Global mean \|SHAP\| bar chart |
+| `shap_beeswarm_global.png` | SHAP beeswarm — all test cells |
+| `shap_beeswarm_per_class.png` | Per-class beeswarm (CD8, CD4, Tumor, …) |
+| `shap_class_heatmap.png` | Marker × cell-type SHAP heatmap |
+| `shap_interaction_CD3_CD8a.png` | CD3 × CD8a dependence plot |
+| `uncertainty_distributions.png` | max_prob and entropy distributions |
+| `uncertainty_ridgeplot.png` | Entropy by cell type (ridge plot) |
+| `uncertainty_confusion_pairs.png` |  Top-20 confusion pairs |
+| `spatial_neighbor_composition.png` | Neighbour composition heatmap |
+| `spatial_cell_interactions.png` | Cell-cell enrichment (permutation test) |
+| `spatial_uncertainty_map.png` | Spatial map of prediction entropy |
+| `image_composition_heatmap.png` | Image × cell-type heatmap |
+| `image_composition_pca.png` | PCA of image compositions |
+| `image_outlier_detection.png` | Anomalous images (Mahalanobis distance) |
 
 ---
 
@@ -219,9 +186,9 @@ If you use this code, please cite:
 ```
 @misc{imc_xai_crc_2024,
   title  = {Explainable ML for Cellular Phenotyping in Imaging Mass Cytometry},
-  author = {<Your Name>},
+  author = {Uliana, Inna , Anna, Oleksandra Tsepilova},
   year   = {2024},
-  url    = {https://github.com/<your-username>/<repo-name>}
+  url    = {https://github.com/inna-tsymb/imc-explainable-ml/tree/main}
 }
 ```
 

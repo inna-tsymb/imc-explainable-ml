@@ -1,0 +1,217 @@
+---
+title: "RAW Proportions & CLEAN Phenotype Clustering"
+author: "Oleksandra Tsepilova"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: united
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = TRUE, warning = FALSE)
+```
+
+## Overview
+This script unifies the datasets to first generate a "RAW" proportion plot, highlighting the corrupted slides flagged by the model as "undefined". Then, it aggressively cleans the dataset and applies a Centered Log-Ratio (CLR) transformation to cluster the remaining healthy tissues into distinct biological phenotypes.
+
+### 1. Load Libraries, Data, and Palette
+
+```{r load-data, message=FALSE}
+library(SingleCellExperiment)
+library(dplyr)
+library(purrr)
+library(ggplot2)
+library(tidyr)
+library(ComplexHeatmap)
+library(circlize)
+
+base_path <- file.path(
+  path.expand("."), 
+  "data", 
+  "Panel_2_10"
+)
+
+plot_dir <- file.path(base_path, "ROut", "plots")
+dir.create(plot_dir, showWarnings = FALSE, recursive = TRUE)
+
+cell_type_colors <- c(
+  B = "red3", BnT = "indianred4", CD4 = "palevioletred1", CD8 = "darkorchid",
+  Treg = "maroon4", NK = "yellow", Igg = "darkred", DC = "green4",
+  Mac = "darkolivegreen", MacCD209 = "olivedrab1", MacCD204 = "olivedrab3",
+  mregDC = "green", Neutrophil = "blue1", PMN_MDSC = "deepskyblue",
+  MDSC = "aquamarine4", Vasculature = "brown2", vCAF = "tomato",
+  Tumor = "sienna4", SMA = "goldenrod2", Fibro = "chocolate1",
+  unlabelled = "gray", undefined = "black"
+)
+
+official_labels <- c(
+  "B", "BnT", "CD4", "CD8", "DC", "Fibro", "Igg", "Mac", "MacCD204", 
+  "MacCD209", "MDSC", "mregDC", "Neutrophil", "NK", "PMN_MDSC", "SMA", 
+  "Treg", "Tumor", "undefined", "Vasculature", "vCAF"
+)
+```
+
+### 2. Extract and Sanitize Ground Truth Labels
+
+```{r sanitize-gates}
+gates <- list.files(file.path(base_path, "gates"), pattern = "\\.rds$", recursive = TRUE, full.names = TRUE)
+
+gate_labels <- purrr::map_dfr(gates, function(path) {
+  x <- readRDS(path)
+  data.frame(
+    sample_id = as.character(x$sample_id),
+    ObjectNumber = as.character(x$ObjectNumber),
+    cell_labels = as.character(x$cytomapper_CellLabel),
+    row.names = NULL
+  )
+})
+
+gate_labels$cell_labels <- trimws(gate_labels$cell_labels)
+gate_labels$cell_labels <- sub("_[0-9]+[a-zA-Z]?$", "", gate_labels$cell_labels)
+gate_labels$cell_labels <- sub(" \\([0-9]+\\)$", "", gate_labels$cell_labels)
+gate_labels$cell_labels[gate_labels$cell_labels == "Cd4"] <- "CD4"
+gate_labels$cell_labels[gate_labels$cell_labels == "Cd8"] <- "CD8"
+gate_labels$cell_labels[gate_labels$cell_labels == "MDSC_"] <- "MDSC"
+gate_labels$cell_labels[!(gate_labels$cell_labels %in% official_labels)] <- "undefined"
+gate_labels$cell_id <- paste0(gate_labels$sample_id, "_", gate_labels$ObjectNumber)
+```
+
+### 3. Master Dataset Consolidation (Keeping RAW Data)
+
+```{r consolidate-datasets}
+spe_base <- readRDS(file.path(base_path, "ROut", "spe.rds"))
+spe_pred <- readRDS(file.path(base_path, "ROut", "spe_unseen_predicted.rds"))
+
+spe_base$cell_id <- paste0(spe_base$sample_id, "_", spe_base$ObjectNumber)
+colnames(spe_base) <- spe_base$cell_id
+
+spe_base$final_label <- "undefined"
+spe_base$label_source <- "Unknown"
+
+match_pred <- match(spe_base$cell_id, spe_pred$cell_id)
+has_pred <- !is.na(match_pred)
+spe_base$final_label[has_pred] <- as.character(spe_pred$predicted_label[match_pred[has_pred]])
+spe_base$label_source[has_pred] <- "XGBoost_Prediction"
+
+match_gt <- match(spe_base$cell_id, gate_labels$cell_id)
+has_gt <- !is.na(match_gt)
+spe_base$final_label[has_gt] <- gate_labels$cell_labels[match_gt[has_gt]]
+spe_base$label_source[has_gt] <- "Manual_GroundTruth"
+
+spe_base$final_label <- factor(spe_base$final_label, levels = official_labels)
+```
+
+### 4. INSIGHT: Plotting the RAW Proportions
+
+We plot the uncleaned data exactly as it is, explicitly showing how the model flagged the corrupted slides by dumping them into the "undefined" category.
+
+```{r plot-raw-insight}
+df_raw <- as.data.frame(colData(spe_base))
+
+prop_df_raw <- df_raw %>%
+  group_by(sample_id, final_label) %>%
+  summarise(Count = n(), .groups = "drop") %>%
+  group_by(sample_id) %>%
+  mutate(Proportion = Count / sum(Count))
+
+pdf(file.path(plot_dir, "07_RAW_Proportions_Per_Image.pdf"), width = 16, height = 10)
+ggplot(prop_df_raw, aes(x = sample_id, y = Proportion, fill = final_label)) +
+  geom_bar(stat = "identity", width = 0.9) +
+  scale_fill_manual(values = cell_type_colors) +
+  theme_classic(base_size = 12) +
+  labs(
+    title = "RAW Cell Type Proportions (Including Model QC Flags)",
+    subtitle = "Solid black bars indicate corrupted slides safely caught by the model as 'undefined'.",
+    x = "Image ID",
+    y = "Relative Proportion"
+  ) +
+  theme(
+    axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5, size = 8),
+    legend.position = "right",
+    legend.title = element_blank()
+  )
+dev.off()
+
+message("Raw proportions plot saved!")
+```
+
+### 5. Data Cleaning for CLR Math
+
+Now that we have the insight visual, we must purge the dead images and the "undefined" cells. If we don't, the CLR math will treat "undefined" as a biological feature and cluster images based on machine error rather than actual biology.
+
+```{r purge-and-clean}
+# 1. Automatically identify dead/blank images (>90% undefined)
+undefined_stats <- df_raw %>%
+  group_by(sample_id) %>%
+  summarise(pct_undefined = sum(final_label == "undefined") / n())
+
+dead_images <- undefined_stats$sample_id[undefined_stats$pct_undefined > 0.90]
+
+# 2. Subset the SPE to drop dead images
+if(length(dead_images) > 0) {
+  spe_master_clean <- spe_base[, !(spe_base$sample_id %in% dead_images)]
+} else {
+  spe_master_clean <- spe_base
+}
+
+# 3. CRITICAL: Drop remaining 'undefined' cells to protect the math
+spe_master_clean <- spe_master_clean[, spe_master_clean$final_label != "undefined"]
+spe_master_clean$final_label <- droplevels(spe_master_clean$final_label)
+
+saveRDS(spe_master_clean, file.path(base_path, "ROut", "spe_master_classified.rds"))
+message("Data successfully cleaned! Ready for CLR.")
+```
+
+### 6. CLEAN TME Phenotype Clustering (CLR Transformation)
+
+We apply a Centered Log-Ratio transformation to the healthy cohort. This prevents massive Tumor/Fibroblast counts from masking subtle fluctuations in critical rare populations, allowing us to accurately cluster the images into biological phenotypes.
+
+```{r clr-heatmap}
+df_master_clean <- as.data.frame(colData(spe_master_clean))
+
+# Prepare Count Matrix
+df_counts <- df_master_clean %>%
+  group_by(sample_id, final_label) %>%
+  summarise(Count = n(), .groups = "drop") %>%
+  pivot_wider(names_from = final_label, values_from = Count, values_fill = 0)
+
+matrix_counts <- as.matrix(df_counts[, -1])
+rownames(matrix_counts) <- df_counts$sample_id
+
+# Add Pseudocount and convert to proportions
+matrix_pseudo <- matrix_counts + 1
+matrix_prop <- sweep(matrix_pseudo, 1, rowSums(matrix_pseudo), "/")
+
+# Apply CLR Transformation
+clr_matrix <- t(apply(matrix_prop, 1, function(x) {
+  log(x / exp(mean(log(x))))
+}))
+
+# Generate ComplexHeatmap
+clr_min <- floor(min(clr_matrix))
+clr_max <- ceiling(max(clr_matrix))
+col_fun <- colorRamp2(c(clr_min, 0, clr_max), c("#2166ac", "white", "#b2182b"))
+
+pdf(file.path(plot_dir, "08_CLEAN_CLR_Phenotype_Heatmap.pdf"), width = 14, height = 10)
+Heatmap(
+  clr_matrix,
+  name = "CLR\nEnrichment",
+  col = col_fun,
+  cluster_rows = TRUE,
+  cluster_columns = TRUE,
+  show_row_names = TRUE,
+  row_names_gp = gpar(fontsize = 8),
+  column_names_rot = 45,
+  column_names_gp = gpar(fontsize = 10),
+  row_title = "Patient Tissue Images\n(Clustered by TME Phenotype)",
+  row_title_gp = gpar(fontsize = 12, fontface = "bold"),
+  column_title = "Cell Types",
+  column_title_gp = gpar(fontsize = 12, fontface = "bold"),
+  rect_gp = gpar(col = "grey90", lwd = 0.5)
+)
+dev.off()
+
+message("Complete! Raw bins and Clean CLR Heatmap saved.")
+```

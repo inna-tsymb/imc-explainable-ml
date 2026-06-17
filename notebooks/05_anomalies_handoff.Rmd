@@ -1,0 +1,178 @@
+---
+title: "TME Heterogeneity & Anomaly Detection"
+author: "Oleksandra Tsepilova"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: united
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = TRUE, warning = FALSE)
+```
+
+## Overview
+This script pivots to mapping intratumoral heterogeneity across the cohort. Because every image comes from a tumor-bearing patient, we apply a Centered Log-Ratio (CLR) transformation to mathematically neutralize the dominant tumor mass and reveal the underlying variance in the immune and stromal compartments. We then run a Principal Component Analysis (PCA) to flag biologically extreme Tumor Microenvironment (TME) phenotypes for team handoff.
+
+### 1. Load Libraries and the QC-Passed Tumor Dataset
+
+```{r load-data, message=FALSE}
+library(SingleCellExperiment)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(ggrepel)
+
+base_path <- file.path(
+  path.expand("."), 
+  "data", 
+  "Panel_2_10"
+)
+
+# Setup output directories
+plot_dir <- file.path(base_path, "ROut", "plots")
+dir.create(plot_dir, showWarnings = FALSE, recursive = TRUE)
+
+# Load the mathematically verified, QC-passed dataset
+# Note: "undefined" machine-error cells and blank slides were purged
+spe_clean <- readRDS(file.path(base_path, "ROut", "spe_master_classified.rds"))
+
+# Double-check factor levels are clean
+spe_clean$final_label <- droplevels(spe_clean$final_label)
+
+message("Loaded QC-passed tumor dataset. Total cells ready for PCA: ", ncol(spe_clean))
+```
+
+### 2. CLR Transformation and PCA
+
+We convert the raw cell counts into compositional proportions. Because this data is dominated by tumor cells, we apply a CLR transformation to center the data around the geometric mean of each image, ensuring rare immune populations drive the PCA variance appropriately.
+
+```{r clr-pca}
+# Generate the raw count matrix (Images as rows, Cell Types as columns)
+df_counts <- as.data.frame(colData(spe_clean)) %>%
+  group_by(sample_id, final_label) %>%
+  summarise(Count = n(), .groups = "drop") %>%
+  pivot_wider(names_from = final_label, values_from = Count, values_fill = 0)
+
+# Extract matrix and add a pseudocount of 1 to avoid log(0) errors
+matrix_counts <- as.matrix(df_counts[, -1])
+rownames(matrix_counts) <- df_counts$sample_id
+matrix_pseudo <- matrix_counts + 1
+
+# Convert to relative proportions per image
+matrix_prop <- sweep(matrix_pseudo, 1, rowSums(matrix_pseudo), "/")
+
+# Apply Centered Log-Ratio (CLR) Transformation
+clr_matrix <- t(apply(matrix_prop, 1, function(x) {
+  log(x / exp(mean(log(x))))
+}))
+
+# Run Principal Component Analysis
+pca_res <- prcomp(clr_matrix, center = TRUE, scale. = FALSE)
+
+# Extract variance explained for the axes
+var_explained <- round(100 * pca_res$sdev^2 / sum(pca_res$sdev^2), 1)
+
+# Format the results into a plotting dataframe
+pca_df <- as.data.frame(pca_res$x)
+pca_df$sample_id <- rownames(pca_df)
+```
+
+### 3. Isolate Outliers (Biological Extremes)
+
+We define an anomaly as any tumor image that falls more than 2 standard deviations away from the cohort mean on either Principal Component 1 (the axis of maximum variance) or Principal Component 2. These represent extreme TME phenotypes (e.g., hyper-inflamed or completely immune-deserted tissues).
+
+```{r isolate-outliers}
+# Calculate statistical boundaries
+sd_pc1 <- sd(pca_df$PC1)
+sd_pc2 <- sd(pca_df$PC2)
+mean_pc1 <- mean(pca_df$PC1)
+mean_pc2 <- mean(pca_df$PC2)
+
+# Flag the anomalies
+pca_df <- pca_df %>%
+  mutate(
+    is_anomaly = abs(PC1 - mean_pc1) > (2 * sd_pc1) | abs(PC2 - mean_pc2) > (2 * sd_pc2)
+  )
+
+anomalous_images <- pca_df$sample_id[pca_df$is_anomaly]
+
+message("Anomaly Detection Complete.")
+message("Identified ", length(anomalous_images), " extreme TME phenotypes out of ", nrow(pca_df), " total QC-passed tumor images.")
+```
+
+### 4. Visualize the Anomaly Map
+
+We plot PC1 vs PC2 and visually highlight the 2-Sigma baseline boundary. Any points falling outside this blue box represent patient tissues with highly unusual biology requiring deeper investigation.
+
+```{r plot-pca-anomalies}
+pdf(file.path(plot_dir, "09_PCA_Anomaly_Map.pdf"), width = 12, height = 8)
+ggplot(pca_df, aes(x = PC1, y = PC2, fill = is_anomaly)) +
+  # Draw boundary boxes representing the 2-Sigma thresholds
+  annotate("rect", 
+           xmin = mean_pc1 - (2*sd_pc1), xmax = mean_pc1 + (2*sd_pc1), 
+           ymin = mean_pc2 - (2*sd_pc2), ymax = mean_pc2 + (2*sd_pc2), 
+           alpha = 0.1, fill = "blue") +
+  geom_point(shape = 21, size = 4, color = "black", alpha = 0.8) +
+  scale_fill_manual(values = c("FALSE" = "grey70", "TRUE" = "red")) +
+  # Only label the anomalous points to keep the plot clean
+  geom_text_repel(
+    data = subset(pca_df, is_anomaly),
+    aes(label = sample_id),
+    size = 3,
+    box.padding = 0.5,
+    max.overlaps = Inf
+  ) +
+  theme_bw(base_size = 14) +
+  labs(
+    title = "Intratumoral Heterogeneity & Anomaly Detection (CLR-PCA)",
+    subtitle = paste0("Red points indicate > 2 SD from the mean. N = ", length(anomalous_images), " extreme phenotypes flagged for handoff."),
+    x = paste0("PC1 (", var_explained[1], "%)"),
+    y = paste0("PC2 (", var_explained[2], "%)"),
+    fill = "Extreme Phenotype"
+  ) +
+  theme(legend.position = "bottom")
+dev.off()
+
+message("PCA Anomaly Map saved to ROut/plots.")
+```
+
+### 5. Generate the Team Handoff Manifest
+
+We isolate the `sample_id`s of the anomalous images and export them to a dedicated text file containing instructions for Person 2 and Person 3.
+
+```{r team-handoff}
+handoff_file <- file.path(base_path, "ROut", "Team_Handoff_Anomalies.txt")
+
+# Write the handoff directives
+writeLines(c(
+  "==================================================",
+  "TME ANOMALY HANDOFF MANIFEST",
+  paste("Generated on:", Sys.time()),
+  "==================================================",
+  "",
+  "The following tumor images exhibited extreme cellular compositions",
+  "following CLR-PCA dimensionality reduction, representing significant",
+  "deviations from the baseline cohort phenotype.",
+  "",
+  "--> ACTION REQUIRED - Inna (Uncertainty):",
+  "Please subset these images and verify if the XGBoost softmax probabilities",
+  "exhibited unusual uncertainty distributions in these specific tissues.",
+  "Check if the model was forced to extrapolate on out-of-distribution biological data.",
+  "",
+  "--> ACTION REQUIRED - Anna (Spatial Context):",
+  "Please map the physical neighborhood graphs (KNN) for these specific outliers",
+  "to determine if this represents a biologically unique Tumor Microenvironment",
+  "(e.g., hyper-inflamed state, invasive margin) or a physical slide artifact.",
+  "",
+  "ANOMALOUS SAMPLE IDs:",
+  "--------------------------------------------------"
+), con = handoff_file)
+
+# Append the actual IDs
+cat(paste(anomalous_images, collapse = "\n"), file = handoff_file, append = TRUE)
+
+message("Handoff manifest successfully written to: ", handoff_file)
+```

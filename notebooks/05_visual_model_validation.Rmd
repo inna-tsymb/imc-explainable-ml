@@ -1,0 +1,319 @@
+---
+title: "Spatial Validation (Training vs. Unseen with Ground Truth)"
+author: "Oleksandra Tsepilova"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: united
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = TRUE, warning = FALSE)
+```
+
+## Overview
+This script loads the predicted unseen cells and samples them alongside images from the training cohort.
+
+### 1. Load Libraries, Data, and Setup Output Directories
+
+```{r load-data}
+library(SingleCellExperiment)
+library(cytomapper)
+library(xgboost)
+library(dplyr)
+library(purrr)
+
+base_path <- file.path(
+  path.expand("."), 
+  "data", 
+  "Panel_2_10"
+)
+
+# Create a dedicated directory to immediately save our high-res plots
+plot_dir <- file.path(base_path, "ROut", "plots")
+dir.create(plot_dir, showWarnings = FALSE, recursive = TRUE)
+
+# Load the UNSEEN predicted data
+spe_unseen <- readRDS(file.path(base_path, "ROut", "spe_unseen_predicted.rds"))
+
+# Load the original base dataset and model
+spe_base <- readRDS(file.path(base_path, "ROut", "spe.rds"))
+final_model <- readRDS(file.path(base_path, "classifier_xgboost.rds"))
+
+# Standardized color palette
+cell_type_colors <- c(
+  B = "red3", BnT = "indianred4", CD4 = "palevioletred1", CD8 = "darkorchid",
+  Treg = "maroon4", NK = "yellow", Igg = "darkred", DC = "green4",
+  Mac = "darkolivegreen", MacCD209 = "olivedrab1", MacCD204 = "olivedrab3",
+  mregDC = "green", Neutrophil = "blue1", PMN_MDSC = "deepskyblue",
+  MDSC = "aquamarine4", Vasculature = "brown2", vCAF = "tomato",
+  Tumor = "sienna4", SMA = "goldenrod2", Fibro = "chocolate1",
+  unlabelled = "gray", undefined = "black"
+)
+
+# Define the exact 21 classes derived from the original training matrix
+official_labels <- c(
+  "B", "BnT", "CD4", "CD8", "DC", "Fibro", "Igg", "Mac", "MacCD204", 
+  "MacCD209", "MDSC", "mregDC", "Neutrophil", "NK", "PMN_MDSC", "SMA", 
+  "Treg", "Tumor", "undefined", "Vasculature", "vCAF"
+)
+```
+
+### 2. Sample Unseen and Training Images
+
+```{r prepare-samples}
+set.seed(0)
+
+# --- A. Prepare Unseen Images ---
+unseen_image_ids <- unique(spe_unseen$sample_id)
+sampled_unseen <- sample(unseen_image_ids, 2)
+val_unseen <- spe_unseen[, spe_unseen$sample_id %in% sampled_unseen]
+val_unseen$image_status <- "Unseen Image"
+
+# --- B. Prepare Training Images and STRICT Ground Truth Labels ---
+gates <- list.files(file.path(base_path, "gates"), pattern = "\\.rds$", recursive = TRUE, full.names = TRUE)
+
+gate_labels <- purrr::map_dfr(gates, function(path) {
+  x <- readRDS(path)
+  data.frame(
+    sample_id = as.character(x$sample_id),
+    ObjectNumber = as.character(x$ObjectNumber),
+    cell_labels = as.character(x$cytomapper_CellLabel),
+    row.names = NULL
+  )
+})
+
+# Aggressively sanitize the manual human annotations
+gate_labels$cell_labels <- trimws(gate_labels$cell_labels)
+gate_labels$cell_labels <- sub("_[0-9]+[a-zA-Z]?$", "", gate_labels$cell_labels)
+gate_labels$cell_labels <- sub(" \\([0-9]+\\)$", "", gate_labels$cell_labels)
+gate_labels$cell_labels[gate_labels$cell_labels == "Cd4"] <- "CD4"
+gate_labels$cell_labels[gate_labels$cell_labels == "Cd8"] <- "CD8"
+gate_labels$cell_labels[gate_labels$cell_labels == "MDSC_"] <- "MDSC"
+gate_labels$cell_labels[!(gate_labels$cell_labels %in% official_labels)] <- "undefined"
+gate_labels$cell_id <- paste0(gate_labels$sample_id, "_", gate_labels$ObjectNumber)
+
+gated_ids <- unique(gate_labels$sample_id)
+valid_training_ids <- intersect(gated_ids, unique(spe_base$sample_id))
+training_image_ids <- setdiff(valid_training_ids, "10123883-USL-VAR-TIS-01-IMC-02_005")
+
+sampled_train <- sample(training_image_ids, 2)
+val_train <- spe_base[, spe_base$sample_id %in% sampled_train]
+val_train$cell_id <- paste0(val_train$sample_id, "_", val_train$ObjectNumber)
+colnames(val_train) <- val_train$cell_id
+
+# Attach the sanitized ground truth labels
+val_train$cell_labels <- "unlabelled"
+match_idx <- match(val_train$cell_id, gate_labels$cell_id)
+has_gate <- !is.na(match_idx)
+val_train$cell_labels[has_gate] <- gate_labels$cell_labels[match_idx[has_gate]]
+
+# Generate predictions
+marker_keep <- !grepl("DNA|Histone", rownames(val_train), ignore.case = TRUE)
+X_train <- t(assay(val_train, "exprs")[marker_keep, ])
+raw_preds <- predict(final_model, newdata = xgboost::xgb.DMatrix(data = X_train))
+
+# Dynamic matrix reshaping
+num_classes <- length(official_labels)
+prob_byrow <- matrix(raw_preds, ncol = num_classes, byrow = TRUE)
+prob_bycol <- matrix(raw_preds, ncol = num_classes, byrow = FALSE)
+
+if (mean(abs(rowSums(prob_byrow) - 1)) < mean(abs(rowSums(prob_bycol) - 1))) {
+  prob_matrix <- prob_byrow
+} else {
+  prob_matrix <- prob_bycol
+}
+
+stopifnot(mean(abs(rowSums(prob_matrix) - 1)) < 1e-6)
+
+val_train$predicted_label <- factor(
+  official_labels[max.col(prob_matrix, ties.method = "first")],
+  levels = official_labels
+)
+val_train$prediction_confidence <- apply(prob_matrix, 1, max)
+val_train$image_status <- "Training Image"
+
+# --- C. Combine Samples ---
+if (!"cell_labels" %in% names(colData(val_unseen))) {
+  val_unseen$cell_labels <- "unlabelled"
+}
+
+shared_cols <- intersect(names(colData(val_train)), names(colData(val_unseen)))
+colData(val_train) <- colData(val_train)[, shared_cols, drop = FALSE]
+colData(val_unseen) <- colData(val_unseen)[, shared_cols, drop = FALSE]
+
+val_spe <- cbind(val_train, val_unseen)
+val_images <- c(sampled_train, sampled_unseen)
+
+message("Training Images: ", paste(sampled_train, collapse = ", "))
+message("Unseen Images: ", paste(sampled_unseen, collapse = ", "))
+```
+
+### 3. Load Spatial TIFFs and Masks
+
+```{r load-spatial}
+images_pattern <- paste0("^", val_images, "[.]tiff$", collapse = "|")
+
+val_images_obj <- loadImages(file.path(base_path, "img"), pattern = images_pattern)
+channelNames(val_images_obj) <- rownames(val_spe)
+
+val_masks_obj <- loadImages(file.path(base_path, "masks"), pattern = images_pattern, as.is = TRUE)
+
+names(val_images_obj) <- sub("\\.tiff$", "", names(val_images_obj))
+names(val_masks_obj) <- sub("\\.tiff$", "", names(val_masks_obj))
+
+img_metadata <- S4Vectors::DataFrame(
+  sample_id = names(val_images_obj),
+  status = ifelse(names(val_images_obj) %in% sampled_train, "Training Image", "Unseen Image")
+)
+S4Vectors::mcols(val_images_obj) <- S4Vectors::mcols(val_masks_obj) <- img_metadata
+```
+
+### 4. Validation 1A: The Full TME Map (Model Predictions)
+
+```{r plot-full-outlines-predictions}
+present_labels_pred <- unique(as.character(val_spe$predicted_label))
+cur_colors_pred <- list(predicted_label = cell_type_colors[names(cell_type_colors) %in% present_labels_pred])
+
+pdf(file.path(plot_dir, "01_Validation_1A_Predicted_TME.pdf"), width = 20, height = 10)
+plotPixels(
+  image = val_images_obj,
+  mask = val_masks_obj,
+  object = val_spe,
+  cell_id = "ObjectNumber",
+  img_id = "sample_id",
+  outline_by = "predicted_label",
+  colour = cur_colors_pred,
+  thick = FALSE,
+  legend = list(
+    outline_by.labels.cex = 0.6,
+    outline_by.legend.cex = 0.6,
+    outline_by.title.cex = 0.8
+  ),
+  image_title = list(text = paste(mcols(val_masks_obj)$sample_id, "-", mcols(val_masks_obj)$status, "(PREDICTED)"), cex = 1)
+)
+dev.off()
+```
+
+### 5. Validation 1B: The Full TME Map (GROUND TRUTH)
+
+```{r plot-full-outlines-gt}
+train_images_obj <- val_images_obj[names(val_images_obj) %in% sampled_train]
+train_masks_obj <- val_masks_obj[names(val_masks_obj) %in% sampled_train]
+train_spe <- val_spe[, val_spe$sample_id %in% sampled_train]
+
+present_labels_gt <- unique(as.character(train_spe$cell_labels))
+cur_colors_gt <- list(cell_labels = cell_type_colors[names(cell_type_colors) %in% present_labels_gt])
+
+pdf(file.path(plot_dir, "02_Validation_1B_GroundTruth_TME.pdf"), width = 20, height = 5)
+plotPixels(
+  image = train_images_obj,
+  mask = train_masks_obj,
+  object = train_spe,
+  cell_id = "ObjectNumber",
+  img_id = "sample_id",
+  outline_by = "cell_labels",
+  colour = cur_colors_gt,
+  thick = FALSE,
+  legend = list(
+    outline_by.labels.cex = 0.6,
+    outline_by.legend.cex = 0.6,
+    outline_by.title.cex = 0.8
+  ),
+  image_title = list(text = paste(mcols(train_masks_obj)$sample_id, "- Training Image (GROUND TRUTH)"), cex = 1)
+)
+dev.off()
+```
+
+### 6. Validation 1C: High-Contrast Tumor Consistency Map
+
+```{r plot-tumor-consistency}
+val_spe$tumor_vs_all <- ifelse(val_spe$predicted_label == "Tumor", "Tumor", "Other")
+tumor_contrast_colors <- list(tumor_vs_all = c(Tumor = "sienna4", Other = "white"))
+
+pdf(file.path(plot_dir, "03_Validation_1C_HighContrast_Tumor.pdf"), width = 20, height = 10)
+plotPixels(
+  image = val_images_obj,
+  mask = val_masks_obj,
+  object = val_spe,
+  cell_id = "ObjectNumber",
+  img_id = "sample_id",
+  outline_by = "tumor_vs_all",
+  colour = tumor_contrast_colors,
+  thick = FALSE,
+  image_title = list(text = paste(mcols(val_masks_obj)$status, "- Predicted Tumor Architecture (Brown vs White)"), cex = 1)
+)
+dev.off()
+```
+
+### 7. Validation 2A: Tumor Overlay Logic (PREDICTED)
+
+```{r plot-tumor-overlay-predicted}
+tumor_markers <- intersect(c("Ecad", "panCK"), rownames(val_spe))
+val_spe$is_tumor_pred <- ifelse(val_spe$predicted_label == "Tumor", "Tumor", "Other")
+tumor_outline_colors <- list(is_tumor_pred = c(Tumor = "#FFFFFF60", Other = NA))
+
+pdf(file.path(plot_dir, "04_Validation_2A_Predicted_Tumor_Overlay.pdf"), width = 20, height = 10)
+plotPixels(
+  image = val_images_obj,
+  mask = val_masks_obj,
+  object = val_spe,
+  cell_id = "ObjectNumber",
+  img_id = "sample_id",
+  colour_by = tumor_markers,
+  outline_by = "is_tumor_pred",
+  colour = tumor_outline_colors,
+  bcg = list(panCK = c(0, 4, 1), Ecad = c(0, 4, 1)), # Dialed back to 4
+  thick = FALSE,
+  image_title = list(text = paste(mcols(val_masks_obj)$status, "- Predicted Tumor Outlines"), cex = 1)
+)
+dev.off()
+```
+
+### 8. Validation 2B: Tumor Overlay Logic (GROUND TRUTH)
+
+```{r plot-tumor-overlay-gt}
+train_spe$is_tumor_gt <- ifelse(train_spe$cell_labels == "Tumor", "Tumor", "Other")
+tumor_outline_colors_gt <- list(is_tumor_gt = c(Tumor = "#FFFFFF60", Other = NA))
+
+pdf(file.path(plot_dir, "05_Validation_2B_GroundTruth_Tumor_Overlay.pdf"), width = 20, height = 5)
+plotPixels(
+  image = train_images_obj,
+  mask = train_masks_obj,
+  object = train_spe,
+  cell_id = "ObjectNumber",
+  img_id = "sample_id",
+  colour_by = tumor_markers,
+  outline_by = "is_tumor_gt",
+  colour = tumor_outline_colors_gt,
+  bcg = list(panCK = c(0, 4, 1), Ecad = c(0, 4, 1)), # Dialed back to 4
+  thick = FALSE,
+  image_title = list(text = paste(mcols(train_masks_obj)$sample_id, "- Training Image (GROUND TRUTH Tumor)"), cex = 1)
+)
+dev.off()
+```
+
+### 9. Validation 3: The `mregDC` Ruleset Check
+
+```{r plot-mregdc-overlay}
+val_spe$is_mregDC <- ifelse(val_spe$predicted_label == "mregDC", "mregDC", "Other")
+mregdc_outline_colors <- list(is_mregDC = c(mregDC = "#FFFFFF60", Other = NA))
+
+pdf(file.path(plot_dir, "06_Validation_3_Predicted_mregDC.pdf"), width = 20, height = 10)
+plotPixels(
+  image = val_images_obj,
+  mask = val_masks_obj,
+  object = val_spe,
+  cell_id = "ObjectNumber",
+  img_id = "sample_id",
+  colour_by = tumor_markers,
+  outline_by = "is_mregDC",
+  colour = mregdc_outline_colors,
+  bcg = list(panCK = c(0, 4, 1), Ecad = c(0, 4, 1)), # Dialed back to 4
+  thick = FALSE,
+  image_title = list(text = paste(mcols(val_masks_obj)$status, "- Predicted mregDC Outlines"), cex = 1)
+)
+dev.off()
+```
