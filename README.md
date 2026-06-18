@@ -157,7 +157,8 @@ install.packages(c(
 | `04_Validation_2A_Predicted_Tumor_Overlay.pdf` | Predicted tumor cells overlayed on top of high-contrast display of panCK and Ecad markers, for marker-cell type validation |
 | `05_Validation_2B_GroundTruth_Tumor_Overlay.pdf` | Same visuals applied to original labels |
 | `06_Validation_3_Predicted_mregDC.pdf` | Predicted mregCD cells overlayed on top of high-contrast display of panCK and Ecad markers, for marker-cell type validation |
-| `07_RAW_Proportions_Per_Image.pdf` | Proportions of predicted cell types per image |
+| `07a_RAW_Proportions_Per_Image.pdf` | Proportions of predicted cell types per image |
+| `07b_QC_Dead_Images_Marker_Heatmap.pdf` | Visualisation of markers on samples with many "undefined" cells predicted |
 | `08_CLEAN_CLR_Phenotype_Heatmap.pdf` | CLR-transforme predicted cell types per image, displayed on heatmap to see presence of sample-level connections  |
 | `09_PCA_Anomaly_Map.pdf` | Visualization of outliers detection (sample-level) for further analysis  |
 | `shap_global_importance.png` | Bar chart that shows the importance of markers for each cell type |

@@ -1,5 +1,5 @@
 ---
-title: "RAW Proportions & CLEAN Phenotype Clustering"
+title: "Phase 3: RAW Proportions, QC Insights & CLEAN Phenotype Clustering"
 author: "Oleksandra Tsepilova"
 date: "`r Sys.Date()`"
 output:
@@ -14,7 +14,7 @@ knitr::opts_chunk$set(echo = TRUE, message = TRUE, warning = FALSE)
 ```
 
 ## Overview
-This script unifies the datasets to first generate a "RAW" proportion plot, highlighting the corrupted slides flagged by the model as "undefined". Then, it aggressively cleans the dataset and applies a Centered Log-Ratio (CLR) transformation to cluster the remaining healthy tissues into distinct biological phenotypes.
+This script unifies datasets to generate a "RAW" proportion plot and a Quality Control (QC) marker heatmap, explicitly proving why corrupted slides were flagged as "undefined". Then, it aggressively cleans the dataset and applies a Centered Log-Ratio (CLR) transformation to cluster the remaining healthy tissues into distinct biological phenotypes.
 
 ### 1. Load Libraries, Data, and Palette
 
@@ -28,8 +28,9 @@ library(ComplexHeatmap)
 library(circlize)
 
 base_path <- file.path(
-  path.expand("."), 
-  "data", 
+  path.expand("~"), 
+  "Downloads", 
+  "XGBoost_classifier_updated", 
   "Panel_2_10"
 )
 
@@ -103,9 +104,7 @@ spe_base$label_source[has_gt] <- "Manual_GroundTruth"
 spe_base$final_label <- factor(spe_base$final_label, levels = official_labels)
 ```
 
-### 4. INSIGHT: Plotting the RAW Proportions
-
-We plot the uncleaned data exactly as it is, explicitly showing how the model flagged the corrupted slides by dumping them into the "undefined" category.
+### 4. INSIGHT 1: Plotting the RAW Proportions
 
 ```{r plot-raw-insight}
 df_raw <- as.data.frame(colData(spe_base))
@@ -116,7 +115,7 @@ prop_df_raw <- df_raw %>%
   group_by(sample_id) %>%
   mutate(Proportion = Count / sum(Count))
 
-pdf(file.path(plot_dir, "07_RAW_Proportions_Per_Image.pdf"), width = 16, height = 10)
+pdf(file.path(plot_dir, "07a_RAW_Proportions_Per_Image.pdf"), width = 16, height = 10)
 ggplot(prop_df_raw, aes(x = sample_id, y = Proportion, fill = final_label)) +
   geom_bar(stat = "identity", width = 0.9) +
   scale_fill_manual(values = cell_type_colors) +
@@ -133,30 +132,80 @@ ggplot(prop_df_raw, aes(x = sample_id, y = Proportion, fill = final_label)) +
     legend.title = element_blank()
   )
 dev.off()
-
-message("Raw proportions plot saved!")
 ```
 
-### 5. Data Cleaning for CLR Math
+### 5. INSIGHT 2: Corrupted Slides Marker Expression Heatmap
 
-Now that we have the insight visual, we must purge the dead images and the "undefined" cells. If we don't, the CLR math will treat "undefined" as a biological feature and cluster images based on machine error rather than actual biology.
+We extract the mean protein expression for the "dead" images and compare them against a baseline average of all healthy images to prove visual signal loss.
 
-```{r purge-and-clean}
-# 1. Automatically identify dead/blank images (>90% undefined)
+```{r qc-marker-heatmap}
+# Identify dead/blank images (>90% undefined)
 undefined_stats <- df_raw %>%
   group_by(sample_id) %>%
   summarise(pct_undefined = sum(final_label == "undefined") / n())
 
 dead_images <- undefined_stats$sample_id[undefined_stats$pct_undefined > 0.90]
 
-# 2. Subset the SPE to drop dead images
+if(length(dead_images) > 0) {
+  
+  # Extract raw marker matrix and combine with sample IDs
+  exprs_matrix <- t(assay(spe_base, "exprs"))
+  exprs_df <- as.data.frame(exprs_matrix)
+  exprs_df$sample_id <- spe_base$sample_id
+  
+  # Calculate mean expression for the dead images
+  dead_exprs <- exprs_df %>%
+    filter(sample_id %in% dead_images) %>%
+    group_by(sample_id) %>%
+    summarise(across(where(is.numeric), \(x) mean(x, na.rm = TRUE)))
+  
+  # Calculate a single "Healthy Baseline" average
+  healthy_baseline <- exprs_df %>%
+    filter(!(sample_id %in% dead_images)) %>%
+    summarise(across(where(is.numeric), \(x) mean(x, na.rm = TRUE))) %>%
+    mutate(sample_id = "HEALTHY_AVERAGE_BASELINE")
+  
+  # Combine into a plotting matrix
+  qc_matrix_df <- bind_rows(dead_exprs, healthy_baseline)
+  rownames(qc_matrix_df) <- qc_matrix_df$sample_id
+  qc_matrix_df$sample_id <- NULL
+  qc_matrix <- as.matrix(qc_matrix_df)
+  
+  # Plot the QC Heatmap
+  pdf(file.path(plot_dir, "07b_QC_Dead_Images_Marker_Heatmap.pdf"), width = 12, height = 5)
+  ht <- Heatmap(
+    qc_matrix,
+    name = "Mean\nExpression",
+    col = colorRamp2(c(0, 1, 3), c("#2166ac", "white", "#b2182b")), # Blue (0) to Red (High)
+    cluster_rows = FALSE,
+    cluster_columns = TRUE,
+    row_title = "Corrupted Slides",
+    row_title_gp = gpar(fontface = "bold", fontsize = 12),
+    column_title = "Protein Markers (Proving Signal Flatline)",
+    column_title_gp = gpar(fontface = "bold", fontsize = 12),
+    rect_gp = gpar(col = "grey90", lwd = 0.5),
+    row_names_side = "left"
+  )
+  draw(ht)
+  dev.off()
+  
+  message("QC Marker Heatmap saved! Flatline signal proven.")
+}
+```
+
+### 6. Data Cleaning for CLR Math
+
+We purge the dead images and the "undefined" cells to protect the clustering algorithms.
+
+```{r purge-and-clean}
+# Subset the SPE to drop dead images
 if(length(dead_images) > 0) {
   spe_master_clean <- spe_base[, !(spe_base$sample_id %in% dead_images)]
 } else {
   spe_master_clean <- spe_base
 }
 
-# 3. CRITICAL: Drop remaining 'undefined' cells to protect the math
+# CRITICAL: Drop remaining 'undefined' cells to protect the math
 spe_master_clean <- spe_master_clean[, spe_master_clean$final_label != "undefined"]
 spe_master_clean$final_label <- droplevels(spe_master_clean$final_label)
 
@@ -164,9 +213,7 @@ saveRDS(spe_master_clean, file.path(base_path, "ROut", "spe_master_classified.rd
 message("Data successfully cleaned! Ready for CLR.")
 ```
 
-### 6. CLEAN TME Phenotype Clustering (CLR Transformation)
-
-We apply a Centered Log-Ratio transformation to the healthy cohort. This prevents massive Tumor/Fibroblast counts from masking subtle fluctuations in critical rare populations, allowing us to accurately cluster the images into biological phenotypes.
+### 7. CLEAN TME Phenotype Clustering (CLR Transformation)
 
 ```{r clr-heatmap}
 df_master_clean <- as.data.frame(colData(spe_master_clean))
@@ -213,5 +260,5 @@ Heatmap(
 )
 dev.off()
 
-message("Complete! Raw bins and Clean CLR Heatmap saved.")
+message("Complete! Raw bins, QC Heatmap, and Clean CLR Heatmap saved.")
 ```
