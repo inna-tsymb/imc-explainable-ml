@@ -49,28 +49,50 @@ print(shp_bundle)
 ## 1. Global mean |SHAP| bar chart
 This averages absolute SHAP values across ALL cell classes to show overall marker ranking.
 ```{r global-and-structural-shap}
+# Remove the "undefied" class from cell types
+shp_bundle_clean <- mshapviz(shp_bundle[names(shp_bundle) != "undefined"])
 
-p_global_imp <- sv_importance(shp_bundle, kind = "bar", max_display = 20) +
+p_global_imp <- sv_importance(shp_bundle_clean, kind = "bar", max_display = 20)
+p_global_imp$mapping$fill <- aes(fill = Feature)$fill
+
+distinct_20_palette <- c(
+  "#2A4B7C", "#E2583E", "#398D8F", "#F2B705", 
+  "#8E44AD", "#2ECC71", "#D35400", "#34495E", 
+  "#1ABC9C", "#C0392B", "#27AE60", "#F39C12", 
+  "#7F8C8D", "#2980B9", "#884EA0", "#D5F5E3", 
+  "#E6B0AA", "#A9DFBF", "#F9E79F", "#D5D8DC"
+)
+
+p_global_imp_final <- p_global_imp +
+  coord_flip() +  
+  scale_fill_manual(values = distinct_20_palette, guide = "none") + 
   theme_bw() +
   labs(
     title = "Global Mean |SHAP| Feature Importance",
     subtitle = "Overall marker contribution averaged across all cell types",
-    x = "Mean |SHAP Value|"
+    x = "Mean |SHAP Value|",
+    y = "Markers"
+  ) +
+  theme(
+    axis.text.y = element_text(size = 10, face = "bold"),
+    axis.text.x = element_text(size = 10),
+    plot.title = element_text(face = "bold", size = 14)
   )
 
-p_global_imp
+p_global_imp_final
 ggsave(
   filename = file.path(base_path, "ROut", "shap_global_importance.png"), 
-  plot = p_global_imp, 
+  plot = p_global_imp_final, 
   width = 16, 
-  height = 9
+  height = 9,
+  dpi = 300
 )
 ```
 
 ## 2. SHAP beeswarm — all test cells
 This combines the distributions of all classes into a singular overarching summary plot.
 ```{r}
-p_global_beeswarm <- shapviz::sv_importance(shp_bundle, kind = "beeswarm", max_display = 10) &
+p_global_beeswarm <- sv_importance(shp_bundle_clean, kind = "beeswarm", max_display = 10) &
   theme_bw() +
   theme(
     axis.text.y = element_text(size = 7, face = "bold"),
@@ -91,7 +113,7 @@ ggsave(
 
 ## 3. Marker x cell-type SHAP heatmap
 ```{r}
-mean_shap_df <- purrr::imap_dfr(shp_bundle, function(shp, class_name) {
+mean_shap_df <- purrr::imap_dfr(shp_bundle_clean, function(shp, class_name) {
   data.frame(
     Marker = colnames(shp$S),
     Mean_Absolute_SHAP = colMeans(abs(shp$S)),
@@ -121,7 +143,8 @@ ggsave(
   filename = file.path(base_path, "ROut", "shap_class_heatmap.png"), 
   plot = p_heatmap, 
   width = 16, 
-  height = 9
+  height = 9,
+  dpi = 300
 )
 
 ```
@@ -142,7 +165,7 @@ plot_cell_type_shap <- function(shp_obj, cell_type_name, top_n = 15) {
 ```
 
 
-## Feature contributions for CD8 and Tumor cells
+## Feature contributions for some types of cells
 ```{r}
 
 # Example A: Why does the model classify cells as CD8?
@@ -153,9 +176,14 @@ p_cd8
 p_tumor <- plot_cell_type_shap(shp_bundle, "Tumor")
 p_tumor
 
+# Example C: How vCAF cells are classified?
+p_vCAF <- plot_cell_type_shap(shp_bundle, "vCAF")
+p_vCAF
+
 #Save plots to the project output directory
 ggsave(file.path(base_path, "ROut", "shap_beeswarm_CD8.png"), plot = p_cd8, width = 8, height = 6)
 ggsave(file.path(base_path, "ROut", "shap_beeswarm_Tumor.png"), plot = p_tumor, width = 8, height = 6)
+ggsave(file.path(base_path, "ROut", "shap_beeswarm_p_vCAF.png"), plot = p_tumor, width = 8, height = 6)
 ```
 
 ## Global feature importance for CD8 and NK
@@ -168,10 +196,24 @@ p_imp_cd8 <- sv_importance(shp_bundle$CD8, kind = "bar", max_display = 15) +
 p_imp_nk <- sv_importance(shp_bundle$NK, kind = "bar", max_display = 15) + 
   labs(title = "Feature Importance for NK") + theme_minimal()
 
-#Display them side-by-side using patchwork
 p_compare <- p_imp_cd8 + p_imp_nk
 p_compare
 ggsave(file.path(base_path, "ROut", "shap_importance_CD8_vs_NK.png"), plot = p_compare, width = 12, height = 6)
+```
+
+## Myeloid Differentiation: MacCD204 vs. MacCD209
+We look at the top macrophage/dendritic subsets to understand how the model draws sharp boundaries between closely related myeloid phenotypes.
+```{r shap-myeloid-dynamics, fig.height=6, fig.width=18}
+p_mac204 <- plot_cell_type_shap(shp_bundle, "MacCD204", top_n = 10) +
+  labs(subtitle = "Marker rules for M2-like Macrophages")
+
+p_mac209 <- plot_cell_type_shap(shp_bundle, "MacCD209", top_n = 10) +
+  labs(subtitle = "Marker rules for CD209+ Macrophages/DCs")
+
+p_myeloid_compare <- p_mac204 + p_mac209
+p_myeloid_compare
+
+ggsave(file.path(base_path, "ROut", "shap_myeloid_comparison.png"), plot = p_myeloid_compare, width = 16, height = 6)
 ```
 
 ##CD3 x CD8a dependence plot
@@ -198,22 +240,6 @@ ggsave(
   height = 9
 )
 ```
-
-## Myeloid Differentiation: MacCD204 vs. MacCD209
-We look at the top macrophage/dendritic subsets to understand how the model draws sharp boundaries between closely related myeloid phenotypes.
-```{r shap-myeloid-dynamics, fig.height=6, fig.width=18}
-p_mac204 <- plot_cell_type_shap(shp_bundle, "MacCD204", top_n = 10) +
-  labs(subtitle = "Marker rules for M2-like Macrophages")
-
-p_mac209 <- plot_cell_type_shap(shp_bundle, "MacCD209", top_n = 10) +
-  labs(subtitle = "Marker rules for CD209+ Macrophages/DCs")
-
-# Display side-by-side using patchwork
-p_myeloid_compare <- p_mac204 + p_mac209
-p_myeloid_compare
-
-ggsave(file.path(base_path, "ROut", "shap_myeloid_comparison.png"), plot = p_myeloid_compare, width = 16, height = 6)
-```
 ## Lymphoid Threshold: FOXP3 Activation in Tregs
 ```{r}
 # Plot FOXP3 expression vs its SHAP value, color-coded by the lymphoid marker CD3
@@ -234,3 +260,64 @@ p_treg_threshold
 
 ggsave(file.path(base_path, "ROut", "shap_treg_foxp3_threshold.png"), plot = p_treg_threshold, width = 16, height = 9)
 ```
+## CD3 x CD20 dependence plot
+```{r}
+# Plot CD20 expression vs its SHAP value, color-coded by the lymphoid marker CD3
+p_treg_threshold <- sv_dependence(
+  shp_bundle$BnT, 
+  v = "CD20", 
+  color_var = "CD3"
+) +
+  theme_bw() +
+  labs(
+    title = "CD20 Activation Threshold for BnT Classification",
+    x = "CD20 Expression Intensity (asinh)",
+    y = "SHAP Value (Impact on BnT Prediction)"
+  )
+
+p_treg_threshold
+
+ggsave(file.path(base_path, "ROut", "shap_BnT_CD20_threshold.png"), plot = p_treg_threshold, width = 16, height = 9)
+```
+
+
+## How CD146 expression shifts decision boundaries between vCAFs and SMA
+```{r}
+# SMA expression colored by CD146 (from vCAF perspective)
+p_vcaf_cd146 <- shapviz::sv_dependence(
+  shp_bundle$vCAF, 
+  v = "SMA", 
+  color_var = "CD146"
+) + 
+  theme_bw() + 
+  labs(title = "vCAF Model Logic", x = "SMA Expression Intensity (asinh)", y = "SHAP for vCAF")
+
+
+# SMA expression colored by CD146 (from SMA perspective)
+p_sma_cd146 <- shapviz::sv_dependence(
+  shp_bundle$SMA, 
+  v = "SMA", 
+  color_var = "CD146"
+) + 
+  theme_bw() + 
+  labs(title = "SMA Model Logic", x = "SMA Expression Intensity (asinh)", y = "SHAP for SMA")
+
+# Stitch CD146 interaction side-by-side
+p_cd146_comparison <- (p_vcaf_cd146 | p_sma_cd146) + 
+  plot_annotation(
+    title = "Stromal Lineage Blur: SMA × CD146 Interaction",
+    subtitle = "Analyzing how CD146 expression shifts decision boundaries between vCAFs and SMA"
+  )
+
+p_cd146_comparison
+
+ggsave(
+  filename = file.path(base_path, "ROut", "shap_blur_SMA_CD146.png"), 
+  plot = p_cd146_comparison, 
+  width = 16, 
+  height = 7, 
+  dpi = 300
+)
+```
+
+
