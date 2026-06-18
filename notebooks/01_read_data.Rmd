@@ -51,8 +51,8 @@ library(ggridges)
 ```{r read-spe}
 base_path <- file.path(
   path.expand("~"),
-  "Desktop",
-  "XGBoost_classifier",
+  "Downloads",
+  "XGBoost_classifier_updated",
   "Panel_2_10"
 )
 
@@ -583,6 +583,9 @@ lab_sce$cell_labels[mregdc_to_tumor] <- "Tumor"
 
 table(lab_sce$cell_labels)
 ```
+```{r save-labeled}
+saveRDS(lab_sce, file.path(base_path, "ROut", "spe_labeled.rds"))
+```
 ## save lab_sce
 
 ```{r}
@@ -755,8 +758,6 @@ print(res$summary)
 ```{r}
 test_sce <- lab_sce[, lab_sce$sample_id %in% res$test_rownames]
 train_sce <- lab_sce[, lab_sce$sample_id %in% res$train_rownames]
-
-saveRDS(train_sce, file.path(base_path, "ROut", "train_sce.rds"))
 ```
 
 
@@ -1627,12 +1628,22 @@ final_model <- xgboost::xgb.train(
 
 save final model via saveRDS
 
-```{r train-final-model, message = FALSE, eval = TRUE}
+```{r save-final-model, message = FALSE, eval = TRUE}
 saveRDS(
   final_model,
-  file = file.path(base_path, "classifier_xgboost.rds")
- )
+  file = file.path(base_path, "ROut", "classifier_xgboost.rds")
+)
 
+# save metadata needed by 02_spatial_xai.Rmd
+saveRDS(
+  list(
+    feature_names    = colnames(X),
+    label_mapping    = label_mapping,
+    params           = params_best,
+    nrounds          = best_nrounds
+  ),
+  file = file.path(base_path, "ROut", "classifier_xgboost_meta.rds")
+)
 ```
 
 
