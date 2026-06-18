@@ -165,8 +165,7 @@ install.packages(c(
 | `shap_beeswarm_global.png` | SHAP beeswarm — summary of how a XGBoost makes decisions across all test cells |
 | `shap_class_heatmap.png` | Marker × cell-type SHAP heatmap |
 | `shap_interaction_CD3_CD8a.png` | CD3 × CD8a dependence plot |
-| `shap_myeloid_comparison.png` | Comparison of the contribution of markers to distinguishing between MacCD204 and MacCD209 |
-| `shap_treg_foxp3_threshold.png` | Representation of how the model determines the structural identity of Tregs using a combination of the FOXP3 and CD3 markers |
+| `shap_blur_SMA_CD146.png` | Visualization of how CD146 and SMA expressions alter the boundaries between vCAF and SMA |
 | `s01_interaction_heatmap` | Interaction heatmap: each cell shows the average z-score for that cell-type pair across all 13 images. The dendrogram clusters cell types with similar spatial patterns.
 | `s02_cd8_tumor_proximity` | CD8–Tumour proximity: A histogram where each bar = one image, x-axis = z-score for that image.  |
 | `s03_tumor_neighbour_fraction` | Tumour neighbour fraction, answering what fraction of each cell direct 15 µm neighbours are Tumour cells? Shown as boxplots per cell type. |
