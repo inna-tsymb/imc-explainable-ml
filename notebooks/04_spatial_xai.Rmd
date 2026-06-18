@@ -1,5 +1,5 @@
 ---
-title: "02_spatial_xai"
+title: "04_spatial_xai"
 ---
 
 ```{r setup, include=FALSE}
@@ -353,6 +353,9 @@ model_aug <- xgb.train(
   nrounds = meta$nrounds,
   verbose = 0
 )
+```
+
+```{r augmented-model, fig.width=9, fig.height=6}
 
 # feature importance: augmented model
 imp_aug <- xgb.importance(model = model_aug)
@@ -377,6 +380,145 @@ p_aug_imp <- ggplot(imp_aug |> slice_max(Gain, n = 30),
 p_aug_imp
 ggsave(file.path(plots_dir, "s04_augmented_feature_importance.png"), p_aug_imp,
        width = 9, height = 6, dpi = 150)
+```
+
+---
+
+## Test set evaluation: marker-only vs augmented
+
+The augmented model trained above used all 13 spatial images. Here we retrain it on the train-only subset so the held-out test images were never seen during augmented model training — giving a fair comparison against the marker-only model.
+
+
+```{r}
+names(meta)           # should show test_image_ids in the list
+meta$test_image_ids   # should show 5 image name strings
+unique(as.character(spe$sample_id))
+```
+
+```{r test-evaluation}
+library(caret)
+
+# Identify which spatial images are held-out test images
+test_imgs_spatial  <- intersect(meta$test_image_ids, unique(spe$sample_id))
+train_imgs_spatial <- setdiff(unique(spe$sample_id), test_imgs_spatial)
+
+cat(sprintf("Spatial images: %d total — %d train, %d test\n",
+            length(unique(spe$sample_id)),
+            length(train_imgs_spatial),
+            length(test_imgs_spatial)))
+```
+
+```{r test-evaluation-run}
+if (length(test_imgs_spatial) == 0) {
+  warning("No held-out test images found in spatial set.")
+} else {
+  # Some cell labels in the spatial set may not appear in the training label mapping
+  # (cell types exclusive to test images). Exclude those cells from evaluation.
+  valid_label <- spe$cell_labels %in% meta$label_mapping
+  if (any(!valid_label)) {
+    cat(sprintf("Excluding %d cells with labels absent from training mapping: %s\n",
+                sum(!valid_label),
+                paste(unique(spe$cell_labels[!valid_label]), collapse = ", ")))
+  }
+
+  is_train <- as.character(spe$sample_id) %in% train_imgs_spatial & valid_label
+  is_test  <- as.character(spe$sample_id) %in% test_imgs_spatial  & valid_label
+  cat(sprintf("Train cells: %d | Test cells: %d\n", sum(is_train), sum(is_test)))
+
+  y_train <- as.integer(factor(spe$cell_labels[is_train], levels = meta$label_mapping)) - 1L
+
+  # Retrain augmented model on train images only (reuses X_augmented, X_markers from previous chunk)
+  dtrain_aug_eval <- xgb.DMatrix(data = X_augmented[is_train, ], label = y_train)
+  set.seed(42)
+  model_aug_eval <- xgb.train(
+    params  = params_aug,
+    data    = dtrain_aug_eval,
+    nrounds = meta$nrounds,
+    verbose = 0
+  )
+
+  true_labels <- factor(spe$cell_labels[is_test], levels = meta$label_mapping)
+
+  # Marker-only model predictions on test set
+  dtest_m      <- xgb.DMatrix(data = X_markers[is_test, ])
+  pred_m_raw   <- predict(model_markers_only, newdata = dtest_m)
+  pred_m_mat   <- matrix(pred_m_raw, ncol = length(meta$label_mapping), byrow = TRUE)
+  pred_markers <- factor(meta$label_mapping[max.col(pred_m_mat)], levels = meta$label_mapping)
+
+  # Augmented model predictions on test set
+  dtest_a       <- xgb.DMatrix(data = X_augmented[is_test, ])
+  pred_a_raw    <- predict(model_aug_eval, newdata = dtest_a)
+  pred_a_mat    <- matrix(pred_a_raw, ncol = length(meta$label_mapping), byrow = TRUE)
+  pred_aug_test <- factor(meta$label_mapping[max.col(pred_a_mat)], levels = meta$label_mapping)
+
+  cm_markers_test <- caret::confusionMatrix(data = pred_markers,  reference = true_labels)
+  cm_aug_test     <- caret::confusionMatrix(data = pred_aug_test, reference = true_labels)
+
+  cat("\n=== Marker-only model — held-out test set ===\n")
+  print(cm_markers_test$overall)
+  cat("\n")
+  print(cm_markers_test$table)
+
+  cat("\n=== Augmented model (markers + neighbourhood) — held-out test set ===\n")
+  print(cm_aug_test$overall)
+  cat("\n")
+  print(cm_aug_test$table)
+
+  cat(sprintf("\nAccuracy delta = %+.5f  |  Kappa delta = %+.5f\n",
+              cm_aug_test$overall["Accuracy"] - cm_markers_test$overall["Accuracy"],
+              cm_aug_test$overall["Kappa"]    - cm_markers_test$overall["Kappa"]))
+  cat("(positive = augmented model better)\n")
+}
+
+
+#              Reference
+# Prediction      B BnT CD4 CD8  DC Fibro Igg Mac MacCD204 MacCD209 MDSC mregDC
+#   B             0   0   6   7   1     3   1   0        7        0    0      0
+#   BnT           0   0   5   7   1     8   0   1        9        1    0      0
+#   CD4           0   0   2   7   0     2   0   0        7        1    0      0
+#   CD8           0   0   7   7   0     5   0   0       13        0    0      0
+#   DC            1   0   6   3   0     3   0   2        6        0    0      0
+#   Fibro         0   1   1   2   0     5   0   0        5        0    0      0
+#   Igg           2   0  11   9   0     1   0   0        9        1    0      0
+#   Mac           0   0   4   3   0     2   0   0        8        1    0      0
+#   MacCD204      0   1   5   3   0     4   0   1        7        0    0      0
+#   MacCD209      0   0   7   5   3     2   0   1       13        1    0      0
+#   MDSC          1   0   6   8   0     8   0   3       11        2    0      0
+#   mregDC        1   0   6   5   2     3   0   0        3        5    0      0
+#   Neutrophil    0   0  11   3   0     7   0   1        9        1    0      0
+#   NK            1   0   8   8   0     2   0   0        3        2    1      0
+#   PMN_MDSC      0   1   3   3   0     3   0   0        5        1    0      0
+#   SMA           0   0   8   6   0     3   0   2        6        2    0      0
+#   Treg          1   0   3   7   0     2   0   1        9        1    0      0
+#   Tumor         0   0   9   6   0     4   0   0        7        0    0      0
+#   undefined     1   0  10   2   0     4   0   1        3        1    1      0
+#   Vasculature   0   0   2   4   0     6   0   0        9        1    0      0
+#   vCAF          0   0   4   8   0     1   0   0       10        0    0      0
+#              Reference
+# Prediction    Neutrophil  NK PMN_MDSC SMA Treg Tumor undefined Vasculature vCAF
+#   B                    0   0        2   1    0   293         4           1    4
+#   BnT                  0   0        1   3    1   267         2           3    4
+#   CD4                  0   0        0   1    1   232         3           1    6
+#   CD8                  1   0        1   3    3   300        10           3    5
+#   DC                   0   0        1   2    3   266         3           1    2
+#   Fibro                0   0        1   3    1   232         3           2    4
+#   Igg                  0   0        0   3    1   279         1           3    4
+#   Mac                  0   0        2   1    1   254         2           3    0
+#   MacCD204             0   0        0   4    1   220         2           3    5
+#   MacCD209             0   0        0   2    1   290         1           0    5
+#   MDSC                 0   0        0   3    2   269         5           1    1
+#   mregDC               0   0        0   3    3   222         3           0    8
+#   Neutrophil           0   0        1   1    1   288         5           2    0
+#   NK                   0   0        0   2    2   281         1           1    5
+#   PMN_MDSC             0   0        0   0    5   229         4           1    4
+#   SMA                  0   0        2   1    3   276         4           2    5
+#   Treg                 0   0        1   1    1   289         4           1    4
+#   Tumor                1   0        0   1    1   235         4           4    4
+#   undefined            0   0        2   6    2   292         3           1    1
+#   Vasculature          0   0        1   2    2   277         3           0    2
+#   vCAF                 1   0        2   2    2   234         3           2    2
+
+# Accuracy delta = +0.00016  |  Kappa delta = -0.00144
 ```
 
 ---
