@@ -45,7 +45,6 @@ data and then interrogated through four complementary XAI lenses:
 .
 ├── notebooks/
 │   ├── 01_read_data.Rmd                             # Preprocessing, spillover, gating, XGBoost CV + final model
-│   ├── 01b_save_shared_objects.Rmd                  # Saves shared RDS objects for notebooks 02–05
 │   ├── 02_shap_analysis.Rmd                         # SHAP values, feature importance, beeswarm, interaction plots
 │   ├── 03a_uncertainty_analysis.Rmd                 # Softmax entropy, per-class uncertainty on labeled test set
 │   ├── 03b_uncertainty_comparison.Rmd               # Uncertainty comparison: labeled test set vs 44 unseen images
@@ -55,7 +54,8 @@ data and then interrogated through four complementary XAI lenses:
 │   ├── 05_dataset_xgboost_composition_analysis.Rmd  # CLR-transformed composition heatmap across all 71 images
 │   └── 05_anomalies_handoff.Rmd                     # PCA outlier detection at sample level
 ├── results/
-│   └── figures/                                     # PNG/PDF outputs from all notebooks
+│   ├── figures/                                     # PNG/PDF outputs from all notebooks
+│   └── tables/                                      # .csv outputs from all notebooks
 ├── install_packages.R                               # R package installation script
 ├── LICENSE
 └── README.md
