@@ -216,7 +216,7 @@ p_myeloid_compare
 ggsave(file.path(base_path, "ROut", "shap_myeloid_comparison.png"), plot = p_myeloid_compare, width = 16, height = 6)
 ```
 
-##CD3 x CD8a dependence plot
+## CD3 x CD8a dependence plot
 Analyzes the core lymphoid lineage switch to see how CD3 impact scales with CD8a expression.
 ```{r}
 p_cd3_cd8a <- sv_dependence(
@@ -227,9 +227,9 @@ p_cd3_cd8a <- sv_dependence(
   theme_bw() +
   labs(
     title = "Lymphoid Lineage Interaction: CD3 × CD8a",
-    subtitle = "Evaluating CD3 SHAP dynamics across the CD8a cytotoxic axis",
+    subtitle = "Deconstructing CD8 prediction logic across the CD3 and CD8a expression axes",
     x = "CD3 Expression Intensity (asinh)",
-    y = "SHAP Value for CD3"
+    y = "SHAP Value for CD8"
   )
 
 p_cd3_cd8a
@@ -240,6 +240,7 @@ ggsave(
   height = 9
 )
 ```
+
 ## Lymphoid Threshold: FOXP3 Activation in Tregs
 ```{r}
 # Plot FOXP3 expression vs its SHAP value, color-coded by the lymphoid marker CD3
@@ -260,6 +261,7 @@ p_treg_threshold
 
 ggsave(file.path(base_path, "ROut", "shap_treg_foxp3_threshold.png"), plot = p_treg_threshold, width = 16, height = 9)
 ```
+
 ## CD3 x CD20 dependence plot
 ```{r}
 # Plot CD20 expression vs its SHAP value, color-coded by the lymphoid marker CD3
